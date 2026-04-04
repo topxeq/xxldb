@@ -165,9 +165,9 @@ SELECT EXPORT_FOLDER(data, '/tmp/restored_project') FROM folders WHERE name = 'm
 | `LIST_FOLDER(data)` | 列出文件夹内容（树形结构） |
 | `FOLDER_FILES(data)` | 统计文件夹中的文件数量 |
 
-**限制：**
-- 单个文件大小限制：10MB
+**说明：**
 - 文件夹结构以JSON格式存储在BLOB中
+- 文件大小限制可通过配置 `MaxFileSize` 设置（默认：无限制）
 
 ## 命令行客户端
 

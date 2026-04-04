@@ -165,9 +165,9 @@ SELECT EXPORT_FOLDER(data, '/tmp/restored_project') FROM folders WHERE name = 'm
 | `LIST_FOLDER(data)` | List folder contents (tree structure) |
 | `FOLDER_FILES(data)` | Count files in folder |
 
-**Limitations:**
-- Single file size limit: 10MB
+**Notes:**
 - Folder structure stored in JSON format within BLOB
+- File size limit configurable via `MaxFileSize` in config (default: unlimited)
 
 ## Command Line Client
 
