@@ -1,45 +1,47 @@
-# XxLdb - 轻量级SQL数据库
+# XxLdb - Lightweight SQL Database
 
-XxLdb 是一个用纯 Go 语言实现的轻量级嵌入式 SQL 数据库。
+[中文文档](README_CN.md)
 
-## 特性
+A lightweight embedded SQL database implemented in pure Go.
 
-- **纯 Go 实现** - 无 CGO 依赖，跨平台支持
-- **完整的 SQL 支持** - SELECT, INSERT, UPDATE, DELETE, CREATE, DROP
-- **JOIN 和 UNION** - 支持 INNER/LEFT/RIGHT JOIN 和 UNION 操作
-- **内置函数** - 字符串、数值、日期、聚合函数
-- **脚本函数** - 支持 xx_ 前缀的自定义脚本函数
-- **文件存储** - 支持 BLOB 和 FILE 类型存储文件/图片/文件夹
-- **WAL 日志** - Write-Ahead Logging 支持崩溃恢复
-- **认证机制** - 支持用户名/密码认证
-- **可配置日志** - 支持 DEBUG/INFO/WARN/ERROR 级别
-- **标准驱动** - 实现 Go 标准数据库驱动接口
+## Features
 
-## 数据类型
+- **Pure Go Implementation** - No CGO dependencies, cross-platform support (Linux/macOS/Windows)
+- **Full SQL Support** - SELECT, INSERT, UPDATE, DELETE, CREATE, DROP
+- **JOIN and UNION** - INNER/LEFT/RIGHT JOIN and UNION operations
+- **Built-in Functions** - String, numeric, date, and aggregate functions
+- **Script Functions** - Custom script functions with `xx_` prefix
+- **File Storage** - BLOB and FILE types for storing files/images/folders
+- **WAL Logging** - Write-Ahead Logging for crash recovery
+- **Authentication** - Username/password authentication support
+- **Configurable Logging** - DEBUG/INFO/WARN/ERROR levels
+- **Standard Driver** - Implements Go standard database/sql driver interface
 
-| 类型 | 说明 |
-|------|------|
-| SEQ | 自增序号 (int64) |
-| INT | 整数 (int64) |
-| FLOAT | 浮点数 (float64) |
-| CHAR(n) | 定长字符串 |
-| VARCHAR(n) | 变长字符串 |
-| TEXT | 大文本 |
-| DATE | 日期 |
-| TIME | 时间 |
-| DATETIME | 日期时间 |
-| BLOB | 二进制大对象 |
-| FILE | 文件引用 |
+## Data Types
 
-## 安装
+| Type | Description |
+|------|-------------|
+| SEQ | Auto-increment sequence (int64) |
+| INT | Integer (int64) |
+| FLOAT | Floating point (float64) |
+| CHAR(n) | Fixed-length string |
+| VARCHAR(n) | Variable-length string |
+| TEXT | Large text |
+| DATE | Date |
+| TIME | Time |
+| DATETIME | Date and time |
+| BLOB | Binary large object |
+| FILE | File reference |
+
+## Installation
 
 ```bash
 go get github.com/topxeq/xxldb
 ```
 
-## 使用方法
+## Quick Start
 
-### 基本用法
+### Basic Usage
 
 ```go
 package main
@@ -53,14 +55,14 @@ import (
 )
 
 func main() {
-    // 打开数据库
+    // Open database
     db, err := sql.Open("xxldb", "/path/to/database")
     if err != nil {
         log.Fatal(err)
     }
     defer db.Close()
 
-    // 创建表
+    // Create table
     _, err = db.Exec(`CREATE TABLE users (
         id SEQ,
         name VARCHAR(100),
@@ -72,18 +74,18 @@ func main() {
         log.Fatal(err)
     }
 
-    // 插入数据
+    // Insert data
     result, err := db.Exec(
         "INSERT INTO users (name, email, age, created_at) VALUES (?, ?, ?, ?)",
-        "张三", "zhangsan@example.com", 25, "2026-01-01 10:00:00",
+        "John", "john@example.com", 25, "2026-01-01 10:00:00",
     )
     if err != nil {
         log.Fatal(err)
     }
     id, _ := result.LastInsertId()
-    fmt.Printf("插入 ID: %d\n", id)
+    fmt.Printf("Inserted ID: %d\n", id)
 
-    // 查询数据
+    // Query data
     rows, err := db.Query("SELECT id, name, email, age FROM users WHERE age > ?", 20)
     if err != nil {
         log.Fatal(err)
@@ -102,16 +104,16 @@ func main() {
 }
 ```
 
-### 内存模式
+### In-Memory Mode
 
 ```go
 db, err := sql.Open("xxldb", ":memory:")
 ```
 
-### 文件存储
+### File Storage
 
 ```sql
--- 创建支持文件的表
+-- Create table with file support
 CREATE TABLE documents (
     id SEQ,
     name VARCHAR(255),
@@ -119,20 +121,20 @@ CREATE TABLE documents (
     created_at DATETIME
 );
 
--- 插入文件内容
+-- Insert file content
 INSERT INTO documents (name, content, created_at)
 VALUES ('report.pdf', LOAD_FILE('/path/to/report.pdf'), NOW());
 
--- 导出文件
+-- Export file
 SELECT content INTO OUTFILE '/tmp/report_copy.pdf' FROM documents WHERE id = 1;
 ```
 
-### 文件夹存储 (特色功能)
+### Folder Storage (Featured)
 
-XxLdb 支持将整个文件夹存储到数据库中：
+XxLdb supports storing entire folders in the database:
 
 ```sql
--- 创建文件夹存储表
+-- Create folder storage table
 CREATE TABLE folders (
     id SEQ,
     name VARCHAR(255),
@@ -140,189 +142,189 @@ CREATE TABLE folders (
     created_at DATETIME
 );
 
--- 加载整个文件夹
+-- Load entire folder
 INSERT INTO folders (name, data, created_at)
 VALUES ('my_project', LOAD_FOLDER('/path/to/project'), NOW());
 
--- 查看文件夹内容
+-- View folder contents
 SELECT LIST_FOLDER(data) FROM folders WHERE name = 'my_project';
 
--- 统计文件数量
+-- Count files
 SELECT FOLDER_FILES(data) FROM folders WHERE name = 'my_project';
 
--- 导出文件夹到指定路径
+-- Export folder to specified path
 SELECT EXPORT_FOLDER(data, '/tmp/restored_project') FROM folders WHERE name = 'my_project';
 ```
 
-**文件夹函数说明：**
+**Folder Functions:**
 
-| 函数 | 说明 |
-|------|------|
-| `LOAD_FOLDER(path)` | 加载文件夹，返回包含完整结构的BLOB数据 |
-| `EXPORT_FOLDER(data, path)` | 将文件夹数据导出到指定路径 |
-| `LIST_FOLDER(data)` | 列出文件夹内容（树形结构） |
-| `FOLDER_FILES(data)` | 统计文件夹中的文件数量 |
+| Function | Description |
+|----------|-------------|
+| `LOAD_FOLDER(path)` | Load folder, returns BLOB data with complete structure |
+| `EXPORT_FOLDER(data, path)` | Export folder data to specified path |
+| `LIST_FOLDER(data)` | List folder contents (tree structure) |
+| `FOLDER_FILES(data)` | Count files in folder |
 
-**限制：**
-- 单个文件大小限制：10MB
-- 文件夹结构以JSON格式存储在BLOB中
+**Limitations:**
+- Single file size limit: 10MB
+- Folder structure stored in JSON format within BLOB
 
-## 命令行客户端
+## Command Line Client
 
 ```bash
-# 打开数据库
+# Open database
 xxldb -db /path/to/database
 
-# 内存模式
+# In-memory mode
 xxldb -memory
 
-# 执行单条SQL
+# Execute single SQL statement
 xxldb -db /path/to/db -e "SELECT * FROM users"
 
-# 设置用户名密码
+# Set username and password
 xxldb -db /path/to/db -user admin -password secret
 ```
 
-### 客户端命令
+### Client Commands
 
-| 命令 | 说明 |
-|------|------|
-| .help | 显示帮助 |
-| .tables | 列出所有表 |
-| .schema <表名> | 显示表结构 |
-| .backup <路径> | 备份数据库 |
-| .restore <路径> | 恢复数据库 |
-| .user <用户名> | 设置用户名 |
-| .password <密码> | 设置密码 |
-| .log <级别> | 设置日志级别 |
-| .quit | 退出程序 |
+| Command | Description |
+|---------|-------------|
+| .help | Show help |
+| .tables | List all tables |
+| .schema <table> | Show table schema |
+| .backup <path> | Backup database |
+| .restore <path> | Restore database |
+| .user <username> | Set username |
+| .password <password> | Set password |
+| .log <level> | Set log level |
+| .quit | Exit program |
 
-## 内置函数
+## Built-in Functions
 
-### 字符串函数
-- `CONCAT(str1, str2, ...)` - 连接字符串
-- `LENGTH(str)` - 字符串长度
-- `UPPER(str)` - 转大写
-- `LOWER(str)` - 转小写
-- `TRIM(str)` - 去除首尾空格
-- `SUBSTRING(str, start, len)` - 子字符串
-- `REPLACE(str, old, new)` - 替换字符串
+### String Functions
+- `CONCAT(str1, str2, ...)` - Concatenate strings
+- `LENGTH(str)` - String length
+- `UPPER(str)` - Convert to uppercase
+- `LOWER(str)` - Convert to lowercase
+- `TRIM(str)` - Remove leading/trailing spaces
+- `SUBSTRING(str, start, len)` - Substring
+- `REPLACE(str, old, new)` - Replace string
 
-### 数值函数
-- `ABS(n)` - 绝对值
-- `ROUND(n, precision)` - 四舍五入
-- `FLOOR(n)` - 向下取整
-- `CEIL(n)` - 向上取整
-- `POWER(base, exp)` - 幂运算
-- `SQRT(n)` - 平方根
-- `MOD(a, b)` - 取模
+### Numeric Functions
+- `ABS(n)` - Absolute value
+- `ROUND(n, precision)` - Round number
+- `FLOOR(n)` - Floor
+- `CEIL(n)` - Ceiling
+- `POWER(base, exp)` - Power
+- `SQRT(n)` - Square root
+- `MOD(a, b)` - Modulo
 
-### 聚合函数
-- `COUNT(*)` - 计数
-- `SUM(col)` - 求和
-- `AVG(col)` - 平均值
-- `MIN(col)` - 最小值
-- `MAX(col)` - 最大值
+### Aggregate Functions
+- `COUNT(*)` - Count rows
+- `SUM(col)` - Sum
+- `AVG(col)` - Average
+- `MIN(col)` - Minimum
+- `MAX(col)` - Maximum
 
-### 日期函数
-- `NOW()` - 当前日期时间
-- `CURRENT_DATE()` - 当前日期
-- `YEAR(date)` - 年份
-- `MONTH(date)` - 月份
-- `DAY(date)` - 日
-- `DATEDIFF(d1, d2)` - 日期差
-- `DATE_ADD(date, days)` - 日期加
+### Date Functions
+- `NOW()` - Current datetime
+- `CURRENT_DATE()` - Current date
+- `YEAR(date)` - Year
+- `MONTH(date)` - Month
+- `DAY(date)` - Day
+- `DATEDIFF(d1, d2)` - Date difference
+- `DATE_ADD(date, days)` - Add days to date
 
-### 转换函数
-- `CAST(val AS type)` - 类型转换
-- `COALESCE(val1, val2, ...)` - 返回第一个非空值
-- `IFNULL(val, default)` - 空值替换
+### Conversion Functions
+- `CAST(val AS type)` - Type conversion
+- `COALESCE(val1, val2, ...)` - Return first non-null value
+- `IFNULL(val, default)` - Null replacement
 
-## 脚本函数
+## Script Functions
 
-脚本函数以 `xx_` 为前缀，存储在 `xxscript` 系统表中：
+Script functions use `xx_` prefix and are stored in the `xxscript` system table:
 
 ```sql
--- 创建脚本函数
+-- Create script function
 INSERT INTO xxscript (name, script, description)
-VALUES ('xx_discount', '$1 * 0.9', '计算折扣价');
+VALUES ('xx_discount', '$1 * 0.9', 'Calculate discounted price');
 
--- 使用脚本函数
+-- Use script function
 SELECT name, xx_discount(price) AS discount_price FROM products;
 ```
 
-## 项目结构
+## Project Structure
 
 ```
 xxldb/
-├── xxldb.go           # 主入口
-├── types/             # 类型定义
-├── storage/           # 存储引擎
-│   ├── storage.go     # 存储管理
-│   ├── page.go        # 页管理
-│   └── wal.go         # WAL 日志
-├── parser/            # SQL 解析器
-│   ├── lexer.go       # 词法分析
-│   ├── parser.go      # 语法解析
-│   └── ast.go         # AST 定义
-├── executor/          # 查询执行器
-├── function/          # 内置函数
-├── script/            # 脚本函数
-├── auth/              # 认证模块
-├── logger/            # 日志模块
-├── driver/            # Go SQL 驱动
-└── cmd/xxldb/         # 命令行客户端
+├── xxldb.go           # Main entry
+├── types/             # Type definitions
+├── storage/           # Storage engine
+│   ├── storage.go     # Storage management
+│   ├── page.go        # Page management
+│   └── wal.go         # WAL logging
+├── parser/            # SQL parser
+│   ├── lexer.go       # Lexer
+│   ├── parser.go      # Parser
+│   └── ast.go         # AST definitions
+├── executor/          # Query executor
+├── function/          # Built-in functions
+├── script/            # Script functions
+├── auth/              # Authentication module
+├── logger/            # Logging module
+├── driver/            # Go SQL driver
+└── cmd/xxldb/         # Command line client
 ```
 
-## 配置选项
+## Configuration
 
 ```go
 config := xxldb.Config{
-    Path:         "/path/to/db",    // 数据库路径
-    InMemory:     false,            // 是否内存模式
-    LogLevel:     "INFO",           // 日志级别
-    Username:     "admin",          // 用户名
-    Password:     "secret",         // 密码
-    AutoCommit:   true,             // 自动提交
-    SyncInterval: 1000,             // 同步间隔(毫秒)
+    Path:         "/path/to/db",    // Database path
+    InMemory:     false,            // In-memory mode
+    LogLevel:     "INFO",           // Log level
+    Username:     "admin",          // Username
+    Password:     "secret",         // Password
+    AutoCommit:   true,             // Auto commit
+    SyncInterval: 1000,             // Sync interval (ms)
 }
 engine, err := xxldb.OpenWithConfig(config)
 ```
 
-## 备份恢复
+## Backup and Restore
 
-### 备份
+### Backup
 
 ```bash
-# 在客户端中
+# In client
 xxldb> .backup /path/to/backup
 
-# 或使用SQL
+# Or using SQL
 BACKUP TO '/path/to/backup';
 ```
 
-### 恢复
+### Restore
 
 ```bash
-# 在客户端中
+# In client
 xxldb> .restore /path/to/backup
 
-# 或使用SQL
+# Or using SQL
 RESTORE FROM '/path/to/backup';
 ```
 
-## 性能特点
+## Performance
 
-- 单表查询: < 1ms (1000行以内)
-- 插入操作: > 10000 ops/sec
-- 并发读取: > 50000 ops/sec
-- 启动时间: < 100ms
-- 内存占用: < 50MB (空数据库)
+- Single table query: < 1ms (under 1000 rows)
+- Insert operations: > 10000 ops/sec
+- Concurrent reads: > 50000 ops/sec
+- Startup time: < 100ms
+- Memory usage: < 50MB (empty database)
 
-## 许可证
+## License
 
 MIT License
 
-## 作者
+## Author
 
 topxeq
