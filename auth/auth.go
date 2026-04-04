@@ -29,6 +29,8 @@ func (a *Auth) SetCredentials(username, password string) {
 	a.username = username
 	if password != "" {
 		a.password = hashPassword(password)
+	} else {
+		a.password = "" // Clear password if empty
 	}
 	a.enabled = username != ""
 }
