@@ -1,0 +1,44 @@
+# Binaries
+xxldb
+xxldb.exe
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output of go coverage
+*.out
+coverage.html
+
+# Go workspace
+go.work
+go.work.sum
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Database files (for testing)
+*.xxldb
+*.db
+
+# Temp files
+temp/
+tmp/
+
+# Log files
+*.log
+
+# Backup files
+*.bak
+*.backup
