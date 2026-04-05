@@ -307,16 +307,16 @@ func (e *Engine) executeSelect(stmt *parser.Statement) (*Result, error) {
 		resultRows = e.filterRows(resultRows, stmt.Where, colIndex)
 	}
 
-	// Handle GROUP BY
-	if len(stmt.GroupBy) > 0 {
+	// Handle GROUP BY with aggregates
+	if len(stmt.GroupBy) > 0 && e.hasAggregateFunctions(stmt.Columns) {
+		resultRows = e.groupWithAggregates(resultRows, stmt.GroupBy, stmt.Columns, colIndex)
+	} else if len(stmt.GroupBy) > 0 {
 		resultRows = e.groupRows(resultRows, stmt.GroupBy, colIndex, stmt.Columns)
+	} else if e.hasAggregateFunctions(stmt.Columns) {
+		// Aggregate without GROUP BY - compute single result
+		resultRows = e.computeAggregates(resultRows, stmt.Columns, colIndex)
 	}
 
-
-		// Handle aggregate functions
-		if e.hasAggregateFunctions(stmt.Columns) {
-			resultRows = e.computeAggregates(resultRows, stmt.Columns, colIndex)
-		}
 	// Handle ORDER BY
 	if len(stmt.OrderBy) > 0 {
 		resultRows = e.sortRows(resultRows, stmt.OrderBy, colIndex)
@@ -449,9 +449,76 @@ func (e *Engine) groupRows(rows []*Row, groupBy []string, colIndex map[string]in
 	var result []*Row
 	for _, groupRows := range groups {
 		if len(groupRows) > 0 {
-			// For aggregate functions, compute results
 			result = append(result, groupRows[0])
 		}
+	}
+
+	return result
+}
+
+// groupWithAggregates groups rows by GROUP BY columns and computes aggregates per group
+func (e *Engine) groupWithAggregates(rows []*Row, groupBy []string, columns []parser.SelectColumn, colIndex map[string]int) []*Row {
+	if len(groupBy) == 0 {
+		return rows
+	}
+
+	// Group rows by GROUP BY columns
+	groups := make(map[string][]*Row)
+	for _, row := range rows {
+		key := e.buildGroupKey(row, groupBy, colIndex)
+		groups[key] = append(groups[key], row)
+	}
+
+	// For each group, compute aggregates and build result row
+	var result []*Row
+	for _, groupRows := range groups {
+		if len(groupRows) == 0 {
+			continue
+		}
+
+		// Build result row for this group
+		data := make([]types.Value, len(columns))
+		for i, col := range columns {
+			if col.Expr == nil {
+				continue
+			}
+
+			if col.Expr.Type == parser.ExprFunction && function.IsAggregate(col.Expr.FuncName) {
+				// Compute aggregate for this group
+				funcName := strings.ToUpper(col.Expr.FuncName)
+				var values []types.Value
+
+				// Collect values from all rows in this group
+				for _, row := range groupRows {
+					if len(col.Expr.Args) > 0 && col.Expr.Args[0].Type != parser.ExprStar {
+						val := e.evalExpr(col.Expr.Args[0], row.Data, colIndex)
+						values = append(values, val)
+					} else {
+						// COUNT(*) case
+						values = append(values, types.NewIntValue(1))
+					}
+				}
+
+				// Call aggregate function
+				aggResult, err := function.Call(funcName, values)
+				if err != nil {
+					data[i] = types.NewNullValue()
+				} else {
+					data[i] = aggResult
+				}
+			} else if col.Expr.Type == parser.ExprColumn {
+				// Non-aggregate column - use value from first row in group
+				idx := colIndex[strings.ToLower(col.Expr.Column)]
+				if idx < len(groupRows[0].Data) {
+					data[i] = groupRows[0].Data[idx]
+				}
+			} else {
+				// Other expression - evaluate with first row
+				data[i] = e.evalExpr(col.Expr, groupRows[0].Data, colIndex)
+			}
+		}
+
+		result = append(result, &Row{Data: data})
 	}
 
 	return result
@@ -638,6 +705,12 @@ func (e *Engine) evalExpr(expr *parser.Expression, row []types.Value, colIndex m
 	case parser.ExprCase:
 		return e.evalCase(expr, row, colIndex)
 
+	case parser.ExprIn:
+		return e.evalIn(expr, row, colIndex)
+
+	case parser.ExprBetween:
+		return e.evalBetween(expr, row, colIndex)
+
 	default:
 		return types.NewNullValue()
 	}
@@ -806,28 +879,36 @@ func (e *Engine) evalLike(left, right types.Value) types.Value {
 }
 
 // matchLike matches a string against a LIKE pattern
+// Supports Unicode characters properly - _ matches exactly one character (not one byte)
 func (e *Engine) matchLike(str, pattern string) bool {
-	// Simplified LIKE matching
-	si, pi := 0, 0
-	starIdx, matchIdx := -1, 0
+	// Convert to runes for proper Unicode handling
+	strRunes := []rune(str)
+	patternRunes := []rune(pattern)
 
+	// Use dynamic programming approach for LIKE matching
+	return matchLikeRunes(strRunes, patternRunes, 0, 0)
+}
+
+// matchLikeRunes performs LIKE matching on rune slices
+func matchLikeRunes(str, pattern []rune, si, pi int) bool {
 	for si < len(str) {
 		if pi < len(pattern) && (pattern[pi] == '_' || pattern[pi] == str[si]) {
 			si++
 			pi++
 		} else if pi < len(pattern) && pattern[pi] == '%' {
-			starIdx = pi
-			matchIdx = si
-			pi++
-		} else if starIdx != -1 {
-			pi = starIdx + 1
-			matchIdx++
-			si = matchIdx
+			// Try matching zero or more characters
+			for i := si; i <= len(str); i++ {
+				if matchLikeRunes(str, pattern, i, pi+1) {
+					return true
+				}
+			}
+			return false
 		} else {
 			return false
 		}
 	}
 
+	// Skip remaining % in pattern
 	for pi < len(pattern) && pattern[pi] == '%' {
 		pi++
 	}
@@ -866,4 +947,37 @@ func (e *Engine) evalArithmetic(left, right types.Value, op string) types.Value 
 		return types.NewIntValue(int64(result))
 	}
 	return types.NewFloatValue(result)
+}
+
+// evalIn evaluates an IN expression
+func (e *Engine) evalIn(expr *parser.Expression, row []types.Value, colIndex map[string]int) types.Value {
+	// Evaluate the left operand
+	left := e.evalExpr(expr.Left, row, colIndex)
+
+	// Check against each value in the list
+	for _, item := range expr.List {
+		right := e.evalExpr(item, row, colIndex)
+		if left.Compare(right) == 0 {
+			return types.NewBoolValue(true)
+		}
+	}
+
+	return types.NewBoolValue(false)
+}
+
+// evalBetween evaluates a BETWEEN expression
+func (e *Engine) evalBetween(expr *parser.Expression, row []types.Value, colIndex map[string]int) types.Value {
+	// Evaluate the value
+	val := e.evalExpr(expr.Left, row, colIndex)
+
+	// Evaluate the bounds
+	lower := e.evalExpr(expr.List[0], row, colIndex)
+	upper := e.evalExpr(expr.List[1], row, colIndex)
+
+	// Check if val is between lower and upper (inclusive)
+	if val.Compare(lower) >= 0 && val.Compare(upper) <= 0 {
+		return types.NewBoolValue(true)
+	}
+
+	return types.NewBoolValue(false)
 }

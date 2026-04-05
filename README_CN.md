@@ -11,15 +11,17 @@
 ## 特性
 
 - **纯 Go 实现** - 无 CGO 依赖，跨平台支持 (Linux/macOS/Windows)
-- **完整的 SQL 支持** - SELECT, INSERT, UPDATE, DELETE, CREATE, DROP
+- **完整的 SQL 支持** - SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER
 - **JOIN 和 UNION** - 支持 INNER/LEFT/RIGHT JOIN 和 UNION 操作
-- **内置函数** - 字符串、数值、日期、聚合函数
+- **内置函数** - 字符串、数值、日期、聚合、图像函数
 - **脚本函数** - 支持 `xx_` 前缀的自定义脚本函数
-- **文件存储** - 支持 BLOB 和 FILE 类型存储文件/图片/文件夹
+- **文件存储** - 支持 BLOB、FILE 和 IMAGE 类型存储文件/图片/文件夹
+- **Unicode 支持** - 字符串函数完整支持 Unicode
 - **WAL 日志** - Write-Ahead Logging 支持崩溃恢复
 - **认证机制** - 支持用户名/密码认证
 - **可配置日志** - 支持 DEBUG/INFO/WARN/ERROR 级别
 - **标准驱动** - 实现 Go 标准数据库驱动接口
+- **数据导入** - 支持 MySQL、PostgreSQL、SQLite、Oracle、MS SQL Server 数据导入
 
 ## 数据类型
 
@@ -36,6 +38,7 @@
 | DATETIME | 日期时间 |
 | BLOB | 二进制大对象 |
 | FILE | 文件引用 |
+| IMAGE | 图像（支持 PNG, JPEG, GIF, BMP, TIFF, WebP） |
 
 ## 安装
 
@@ -207,7 +210,9 @@ xxldb -db /path/to/db -user admin -password secret
 
 ### 字符串函数
 - `CONCAT(str1, str2, ...)` - 连接字符串
-- `LENGTH(str)` - 字符串长度
+- `LENGTH(str)` - 字符串长度（字符数，支持Unicode）
+- `BYTE_LENGTH(str)` / `OCTET_LENGTH(str)` - 字符串长度（字节数）
+- `CHAR_LENGTH(str)` / `CHARACTER_LENGTH(str)` - LENGTH的别名
 - `UPPER(str)` - 转大写
 - `LOWER(str)` - 转小写
 - `TRIM(str)` - 去除首尾空格
@@ -243,6 +248,37 @@ xxldb -db /path/to/db -user admin -password secret
 - `CAST(val AS type)` - 类型转换
 - `COALESCE(val1, val2, ...)` - 返回第一个非空值
 - `IFNULL(val, default)` - 空值替换
+
+### 图像函数
+- `LOAD_IMAGE(path)` - 从文件加载图像
+- `IMAGE_FROM_BASE64(str)` - 从BASE64字符串创建图像
+- `IMAGE_TO_BASE64(img)` - 转换为BASE64
+- `IMAGE_TO_BASE64(img, 'datauri')` - 转换为Data URI格式
+- `IMAGE_WIDTH(img)` - 获取图像宽度
+- `IMAGE_HEIGHT(img)` - 获取图像高度
+- `IMAGE_FORMAT(img)` - 获取图像格式 (png/jpeg/gif/...)
+- `IMAGE_SIZE(img)` - 获取图像大小（字节）
+- `IMAGE_MIME(img)` - 获取MIME类型
+
+#### 图像示例
+```sql
+CREATE TABLE photos (id SEQ, name VARCHAR(100), img IMAGE);
+
+-- 从文件加载
+INSERT INTO photos (name, img) VALUES ('sunset', LOAD_IMAGE('/path/to/sunset.jpg'));
+
+-- 从BASE64加载
+INSERT INTO photos (name, img) VALUES ('avatar', IMAGE_FROM_BASE64('iVBORw0KGgo...'));
+
+-- 从Data URI加载
+INSERT INTO photos (name, img) VALUES ('logo', IMAGE_FROM_BASE64('data:image/png;base64,iVBORw0KGgo...'));
+
+-- 查询图像信息
+SELECT name, IMAGE_WIDTH(img), IMAGE_HEIGHT(img), IMAGE_FORMAT(img) FROM photos;
+
+-- 导出为Data URI（可直接嵌入HTML）
+SELECT name, IMAGE_TO_BASE64(img, 'datauri') FROM photos;
+```
 
 ## 脚本函数
 

@@ -28,6 +28,7 @@ const (
 	TypeDatetime         // Date and time
 	TypeBlob             // Binary large object
 	TypeFile             // File reference
+	TypeImage            // Image with metadata
 )
 
 // String returns the string representation of the data type
@@ -57,6 +58,8 @@ func (dt DataType) String() string {
 		return "BLOB"
 	case TypeFile:
 		return "FILE"
+	case TypeImage:
+		return "IMAGE"
 	default:
 		return "UNKNOWN"
 	}
@@ -94,6 +97,8 @@ func ParseDataType(s string) DataType {
 		return TypeBlob
 	case "FILE":
 		return TypeFile
+	case "IMAGE", "IMG", "PICTURE":
+		return TypeImage
 	default:
 		return TypeUnknown
 	}
@@ -116,7 +121,7 @@ func (dt DataType) IsDateTime() bool {
 
 // IsBinary returns true if the type is binary
 func (dt DataType) IsBinary() bool {
-	return dt == TypeBlob || dt == TypeFile
+	return dt == TypeBlob || dt == TypeFile || dt == TypeImage
 }
 
 // Size returns the fixed size of the type in bytes, or -1 for variable
@@ -194,6 +199,11 @@ func NewDatetimeValue(t time.Time) Value {
 // NewBlobValue creates a blob value
 func NewBlobValue(data []byte) Value {
 	return Value{Type: TypeBlob, Data: data}
+}
+
+// NewImageValue creates an image value
+func NewImageValue(data []byte) Value {
+	return Value{Type: TypeImage, Data: data}
 }
 
 // detectType detects the DataType from interface{}

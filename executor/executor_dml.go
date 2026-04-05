@@ -124,11 +124,11 @@ func (e *Engine) executeUpdate(stmt *parser.Statement) (*Result, error) {
 		colIndex[strings.ToLower(col.Name)] = i
 	}
 
-	// Build updates map
-	updates := make(map[int]types.Value)
+	// Store update expressions for later evaluation with row context
+	updateExprs := make(map[int]*parser.Expression)
 	for colName, expr := range stmt.Updates {
 		idx := colIndex[strings.ToLower(colName)]
-		updates[idx] = e.evalExpr(expr, nil, nil)
+		updateExprs[idx] = expr
 	}
 
 	// Build condition function
@@ -139,8 +139,18 @@ func (e *Engine) executeUpdate(stmt *parser.Statement) (*Result, error) {
 		return e.evalBool(stmt.Where, row, colIndex)
 	}
 
+	// Build update function that evaluates expressions with current row context
+	updateFunc := func(row []types.Value) map[int]types.Value {
+		updates := make(map[int]types.Value)
+		for idx, expr := range updateExprs {
+			// Evaluate expression with current row values
+			updates[idx] = e.evalExpr(expr, row, colIndex)
+		}
+		return updates
+	}
+
 	// Update rows via storage
-	count, err := e.storage.UpdateRows(stmt.Table, updates, condition)
+	count, err := e.storage.UpdateRowsWithFunc(stmt.Table, updateFunc, condition)
 	if err != nil {
 		return nil, err
 	}

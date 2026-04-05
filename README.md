@@ -11,15 +11,17 @@ A lightweight embedded SQL database implemented in pure Go.
 ## Features
 
 - **Pure Go Implementation** - No CGO dependencies, cross-platform support (Linux/macOS/Windows)
-- **Full SQL Support** - SELECT, INSERT, UPDATE, DELETE, CREATE, DROP
+- **Full SQL Support** - SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER
 - **JOIN and UNION** - INNER/LEFT/RIGHT JOIN and UNION operations
-- **Built-in Functions** - String, numeric, date, and aggregate functions
+- **Built-in Functions** - String, numeric, date, aggregate, and image functions
 - **Script Functions** - Custom script functions with `xx_` prefix
-- **File Storage** - BLOB and FILE types for storing files/images/folders
+- **File Storage** - BLOB, FILE and IMAGE types for storing files/images/folders
+- **Unicode Support** - Full Unicode support for string functions
 - **WAL Logging** - Write-Ahead Logging for crash recovery
 - **Authentication** - Username/password authentication support
 - **Configurable Logging** - DEBUG/INFO/WARN/ERROR levels
 - **Standard Driver** - Implements Go standard database/sql driver interface
+- **Data Import** - Import from MySQL, PostgreSQL, SQLite, Oracle, MS SQL Server
 
 ## Data Types
 
@@ -36,6 +38,7 @@ A lightweight embedded SQL database implemented in pure Go.
 | DATETIME | Date and time |
 | BLOB | Binary large object |
 | FILE | File reference |
+| IMAGE | Image with metadata (supports PNG, JPEG, GIF, BMP, TIFF, WebP) |
 
 ## Installation
 
@@ -207,7 +210,9 @@ xxldb -db /path/to/db -user admin -password secret
 
 ### String Functions
 - `CONCAT(str1, str2, ...)` - Concatenate strings
-- `LENGTH(str)` - String length
+- `LENGTH(str)` - String length in characters (Unicode-aware)
+- `BYTE_LENGTH(str)` / `OCTET_LENGTH(str)` - String length in bytes
+- `CHAR_LENGTH(str)` / `CHARACTER_LENGTH(str)` - Alias for LENGTH
 - `UPPER(str)` - Convert to uppercase
 - `LOWER(str)` - Convert to lowercase
 - `TRIM(str)` - Remove leading/trailing spaces
@@ -243,6 +248,37 @@ xxldb -db /path/to/db -user admin -password secret
 - `CAST(val AS type)` - Type conversion
 - `COALESCE(val1, val2, ...)` - Return first non-null value
 - `IFNULL(val, default)` - Null replacement
+
+### Image Functions
+- `LOAD_IMAGE(path)` - Load image from file
+- `IMAGE_FROM_BASE64(str)` - Create image from BASE64 string
+- `IMAGE_TO_BASE64(img)` - Convert image to BASE64
+- `IMAGE_TO_BASE64(img, 'datauri')` - Convert to Data URI format
+- `IMAGE_WIDTH(img)` - Get image width
+- `IMAGE_HEIGHT(img)` - Get image height
+- `IMAGE_FORMAT(img)` - Get image format (png/jpeg/gif/...)
+- `IMAGE_SIZE(img)` - Get image size in bytes
+- `IMAGE_MIME(img)` - Get MIME type
+
+#### Image Example
+```sql
+CREATE TABLE photos (id SEQ, name VARCHAR(100), img IMAGE);
+
+-- Load from file
+INSERT INTO photos (name, img) VALUES ('sunset', LOAD_IMAGE('/path/to/sunset.jpg'));
+
+-- Load from BASE64
+INSERT INTO photos (name, img) VALUES ('avatar', IMAGE_FROM_BASE64('iVBORw0KGgo...'));
+
+-- Load from Data URI
+INSERT INTO photos (name, img) VALUES ('logo', IMAGE_FROM_BASE64('data:image/png;base64,iVBORw0KGgo...'));
+
+-- Query image info
+SELECT name, IMAGE_WIDTH(img), IMAGE_HEIGHT(img), IMAGE_FORMAT(img) FROM photos;
+
+-- Export as Data URI (for HTML embedding)
+SELECT name, IMAGE_TO_BASE64(img, 'datauri') FROM photos;
+```
 
 ## Script Functions
 

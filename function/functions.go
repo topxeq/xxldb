@@ -2,8 +2,14 @@
 package function
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/gif"
+	"image/jpeg"
+	"image/png"
+	"io"
 	"math"
 	"math/rand"
 	"os"
@@ -11,6 +17,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/topxeq/xxldb/types"
 )
@@ -26,6 +33,10 @@ func init() {
 	Register("CONCAT", fnConcat)
 	Register("LENGTH", fnLength)
 	Register("LEN", fnLength)
+	Register("BYTE_LENGTH", fnByteLength)
+	Register("OCTET_LENGTH", fnByteLength)
+	Register("CHAR_LENGTH", fnLength)
+	Register("CHARACTER_LENGTH", fnLength)
 	Register("UPPER", fnUpper)
 	Register("LOWER", fnLower)
 	Register("TRIM", fnTrim)
@@ -139,6 +150,16 @@ func init() {
 
 	// UUID function
 	Register("UUID", fnUuid)
+
+	// Image functions
+	Register("LOAD_IMAGE", fnLoadImage)
+	Register("IMAGE_FROM_BASE64", fnImageFromBase64)
+	Register("IMAGE_TO_BASE64", fnImageToBase64)
+	Register("IMAGE_WIDTH", fnImageWidth)
+	Register("IMAGE_HEIGHT", fnImageHeight)
+	Register("IMAGE_FORMAT", fnImageFormat)
+	Register("IMAGE_SIZE", fnImageSize)
+	Register("IMAGE_MIME", fnImageMime)
 }
 
 // Register registers a function
@@ -184,6 +205,19 @@ func fnLength(args []types.Value) (types.Value, error) {
 		return types.NewNullValue(), nil
 	}
 	s := args[0].ToString()
+	// Return character count (runes), not byte count
+	return types.NewIntValue(int64(utf8.RuneCountInString(s))), nil
+}
+
+func fnByteLength(args []types.Value) (types.Value, error) {
+	if len(args) != 1 {
+		return types.Value{}, fmt.Errorf("BYTE_LENGTH requires 1 argument")
+	}
+	if args[0].IsNull {
+		return types.NewNullValue(), nil
+	}
+	s := args[0].ToString()
+	// Return byte count (UTF-8 encoded)
 	return types.NewIntValue(int64(len(s))), nil
 }
 
@@ -263,20 +297,26 @@ func fnSubstring(args []types.Value) (types.Value, error) {
 	start, _ := args[1].ToInt64()
 	start-- // SQL is 1-indexed
 
-	length := int64(len(s))
+	// Convert to runes for proper Unicode handling
+	runes := []rune(s)
+	runeLen := int64(len(runes))
 	if len(args) > 2 {
-		length, _ = args[2].ToInt64()
+		runeLen, _ = args[2].ToInt64()
 	}
 
 	if start < 0 {
 		start = 0
 	}
-	end := int(start + length)
-	if end > len(s) {
-		end = len(s)
+	end := int(start + runeLen)
+	if end > len(runes) {
+		end = len(runes)
 	}
 
-	return types.NewStringValue(s[start:end]), nil
+	if int(start) > len(runes) {
+		return types.NewStringValue(""), nil
+	}
+
+	return types.NewStringValue(string(runes[start:end])), nil
 }
 
 func fnLeft(args []types.Value) (types.Value, error) {
@@ -288,10 +328,13 @@ func fnLeft(args []types.Value) (types.Value, error) {
 	}
 	s := args[0].ToString()
 	n, _ := args[1].ToInt64()
-	if n > int64(len(s)) {
-		n = int64(len(s))
+
+	// Convert to runes for proper Unicode handling
+	runes := []rune(s)
+	if n > int64(len(runes)) {
+		n = int64(len(runes))
 	}
-	return types.NewStringValue(s[:n]), nil
+	return types.NewStringValue(string(runes[:n])), nil
 }
 
 func fnRight(args []types.Value) (types.Value, error) {
@@ -303,10 +346,13 @@ func fnRight(args []types.Value) (types.Value, error) {
 	}
 	s := args[0].ToString()
 	n, _ := args[1].ToInt64()
-	if n > int64(len(s)) {
-		n = int64(len(s))
+
+	// Convert to runes for proper Unicode handling
+	runes := []rune(s)
+	if n > int64(len(runes)) {
+		n = int64(len(runes))
 	}
-	return types.NewStringValue(s[len(s)-int(n):]), nil
+	return types.NewStringValue(string(runes[len(runes)-int(n):])), nil
 }
 
 func fnReplace(args []types.Value) (types.Value, error) {
@@ -331,7 +377,16 @@ func fnInstr(args []types.Value) (types.Value, error) {
 	}
 	s := args[0].ToString()
 	substr := args[1].ToString()
-	return types.NewIntValue(int64(strings.Index(s, substr) + 1)), nil
+
+	// Find byte position
+	bytePos := strings.Index(s, substr)
+	if bytePos == -1 {
+		return types.NewIntValue(0), nil
+	}
+
+	// Convert byte position to character position
+	charPos := utf8.RuneCountInString(s[:bytePos]) + 1
+	return types.NewIntValue(int64(charPos)), nil
 }
 
 func fnLpad(args []types.Value) (types.Value, error) {
@@ -345,13 +400,17 @@ func fnLpad(args []types.Value) (types.Value, error) {
 	length, _ := args[1].ToInt64()
 	pad := args[2].ToString()
 
-	for int64(len(s)) < length {
-		s = pad + s
+	// Convert to runes for proper Unicode handling
+	runes := []rune(s)
+	padRunes := []rune(pad)
+
+	for int64(len(runes)) < length {
+		runes = append(padRunes, runes...)
 	}
-	if int64(len(s)) > length {
-		s = s[int64(len(s))-length:]
+	if int64(len(runes)) > length {
+		runes = runes[int64(len(runes))-length:]
 	}
-	return types.NewStringValue(s), nil
+	return types.NewStringValue(string(runes)), nil
 }
 
 func fnRpad(args []types.Value) (types.Value, error) {
@@ -365,13 +424,17 @@ func fnRpad(args []types.Value) (types.Value, error) {
 	length, _ := args[1].ToInt64()
 	pad := args[2].ToString()
 
-	for int64(len(s)) < length {
-		s = s + pad
+	// Convert to runes for proper Unicode handling
+	runes := []rune(s)
+	padRunes := []rune(pad)
+
+	for int64(len(runes)) < length {
+		runes = append(runes, padRunes...)
 	}
-	if int64(len(s)) > length {
-		s = s[:length]
+	if int64(len(runes)) > length {
+		runes = runes[:length]
 	}
-	return types.NewStringValue(s), nil
+	return types.NewStringValue(string(runes)), nil
 }
 
 func fnReverse(args []types.Value) (types.Value, error) {
@@ -1560,3 +1623,273 @@ func fnUuid(args []types.Value) (types.Value, error) {
 	uuid[8] = (uuid[8] & 0x3f) | 0x80
 	return types.NewStringValue(fmt.Sprintf("%x-%x-%x-%x-%x", uuid[0:4], uuid[4:6], uuid[6:8], uuid[8:10], uuid[10:])), nil
 }
+
+// ==================== Image Functions ====================
+
+// ImageInfo holds image metadata
+type ImageInfo struct {
+	Width  int    `json:"width"`
+	Height int    `json:"height"`
+	Format string `json:"format"`
+	Size   int    `json:"size"`
+	Mime   string `json:"mime"`
+}
+
+// formatToMime maps image format to MIME type
+var formatToMime = map[string]string{
+	"png":  "image/png",
+	"jpeg": "image/jpeg",
+	"jpg":  "image/jpeg",
+	"gif":  "image/gif",
+	"bmp":  "image/bmp",
+	"tiff": "image/tiff",
+}
+
+// parseImageInfo extracts image metadata from binary data
+func parseImageInfo(data []byte) (*ImageInfo, error) {
+	if len(data) == 0 {
+		return nil, fmt.Errorf("empty image data")
+	}
+
+	info := &ImageInfo{
+		Size: len(data),
+	}
+
+	// Try to decode image to get dimensions
+	reader := strings.NewReader(string(data))
+	img, format, err := image.DecodeConfig(reader)
+	if err != nil {
+		// If decode fails, try to detect format from header
+		info.Format = detectImageFormat(data)
+		if info.Format == "" {
+			info.Format = "unknown"
+		}
+	} else {
+		info.Width = img.Width
+		info.Height = img.Height
+		info.Format = format
+	}
+
+	if mime, ok := formatToMime[info.Format]; ok {
+		info.Mime = mime
+	} else {
+		info.Mime = "application/octet-stream"
+	}
+
+	return info, nil
+}
+
+// detectImageFormat detects image format from magic bytes
+func detectImageFormat(data []byte) string {
+	if len(data) < 8 {
+		return ""
+	}
+
+	// PNG: 89 50 4E 47 0D 0A 1A 0A
+	if data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47 {
+		return "png"
+	}
+	// JPEG: FF D8 FF
+	if data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF {
+		return "jpeg"
+	}
+	// GIF: 47 49 46 38
+	if data[0] == 0x47 && data[1] == 0x49 && data[2] == 0x46 && data[3] == 0x38 {
+		return "gif"
+	}
+	// BMP: 42 4D
+	if data[0] == 0x42 && data[1] == 0x4D {
+		return "bmp"
+	}
+	// TIFF: 49 49 or 4D 4D
+	if (data[0] == 0x49 && data[1] == 0x49) || (data[0] == 0x4D && data[1] == 0x4D) {
+		return "tiff"
+	}
+	// WebP: 52 49 46 46 ... 57 45 42 50
+	if data[0] == 0x52 && data[1] == 0x49 && data[2] == 0x46 && data[3] == 0x46 {
+		if len(data) > 11 && data[8] == 0x57 && data[9] == 0x45 && data[10] == 0x42 && data[11] == 0x50 {
+			return "webp"
+		}
+	}
+
+	return ""
+}
+
+// getImageData extracts binary data from IMAGE or BLOB value
+func getImageData(val types.Value) ([]byte, error) {
+	if val.IsNull {
+		return nil, fmt.Errorf("image is null")
+	}
+
+	if val.Type == types.TypeImage || val.Type == types.TypeBlob {
+		if data, ok := val.Data.([]byte); ok {
+			return data, nil
+		}
+	}
+
+	return nil, fmt.Errorf("expected IMAGE or BLOB type, got %s", val.Type)
+}
+
+func fnLoadImage(args []types.Value) (types.Value, error) {
+	if len(args) != 1 {
+		return types.Value{}, fmt.Errorf("LOAD_IMAGE requires 1 argument: file path")
+	}
+	if args[0].IsNull {
+		return types.NewNullValue(), nil
+	}
+
+	filePath := args[0].ToString()
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return types.NewNullValue(), nil
+	}
+
+	return types.NewImageValue(data), nil
+}
+
+func fnImageFromBase64(args []types.Value) (types.Value, error) {
+	if len(args) < 1 {
+		return types.Value{}, fmt.Errorf("IMAGE_FROM_BASE64 requires at least 1 argument")
+	}
+	if args[0].IsNull {
+		return types.NewNullValue(), nil
+	}
+
+	input := args[0].ToString()
+
+	// Handle Data URI format: data:image/png;base64,iVBORw0KGgo...
+	if strings.HasPrefix(input, "data:image/") {
+		// Extract base64 part after comma
+		if idx := strings.Index(input, ","); idx != -1 {
+			input = input[idx+1:]
+		}
+	}
+
+	// Decode base64
+	data, err := base64.StdEncoding.DecodeString(input)
+	if err != nil {
+		// Try URL encoding
+		data, err = base64.URLEncoding.DecodeString(input)
+		if err != nil {
+			return types.Value{}, fmt.Errorf("invalid base64 data: %v", err)
+		}
+	}
+
+	return types.NewImageValue(data), nil
+}
+
+func fnImageToBase64(args []types.Value) (types.Value, error) {
+	if len(args) < 1 {
+		return types.Value{}, fmt.Errorf("IMAGE_TO_BASE64 requires at least 1 argument")
+	}
+
+	data, err := getImageData(args[0])
+	if err != nil {
+		return types.NewNullValue(), nil
+	}
+
+	encoded := base64.StdEncoding.EncodeToString(data)
+
+	// Check if user wants Data URI format
+	if len(args) > 1 && strings.ToLower(args[1].ToString()) == "datauri" {
+		info, err := parseImageInfo(data)
+		if err == nil {
+			encoded = fmt.Sprintf("data:%s;base64,%s", info.Mime, encoded)
+		}
+	}
+
+	return types.NewStringValue(encoded), nil
+}
+
+func fnImageWidth(args []types.Value) (types.Value, error) {
+	if len(args) != 1 {
+		return types.Value{}, fmt.Errorf("IMAGE_WIDTH requires 1 argument")
+	}
+
+	data, err := getImageData(args[0])
+	if err != nil {
+		return types.NewNullValue(), nil
+	}
+
+	info, err := parseImageInfo(data)
+	if err != nil {
+		return types.NewNullValue(), nil
+	}
+
+	return types.NewIntValue(int64(info.Width)), nil
+}
+
+func fnImageHeight(args []types.Value) (types.Value, error) {
+	if len(args) != 1 {
+		return types.Value{}, fmt.Errorf("IMAGE_HEIGHT requires 1 argument")
+	}
+
+	data, err := getImageData(args[0])
+	if err != nil {
+		return types.NewNullValue(), nil
+	}
+
+	info, err := parseImageInfo(data)
+	if err != nil {
+		return types.NewNullValue(), nil
+	}
+
+	return types.NewIntValue(int64(info.Height)), nil
+}
+
+func fnImageFormat(args []types.Value) (types.Value, error) {
+	if len(args) != 1 {
+		return types.Value{}, fmt.Errorf("IMAGE_FORMAT requires 1 argument")
+	}
+
+	data, err := getImageData(args[0])
+	if err != nil {
+		return types.NewNullValue(), nil
+	}
+
+	info, err := parseImageInfo(data)
+	if err != nil {
+		return types.NewNullValue(), nil
+	}
+
+	return types.NewStringValue(info.Format), nil
+}
+
+func fnImageSize(args []types.Value) (types.Value, error) {
+	if len(args) != 1 {
+		return types.Value{}, fmt.Errorf("IMAGE_SIZE requires 1 argument")
+	}
+
+	data, err := getImageData(args[0])
+	if err != nil {
+		return types.NewNullValue(), nil
+	}
+
+	return types.NewIntValue(int64(len(data))), nil
+}
+
+func fnImageMime(args []types.Value) (types.Value, error) {
+	if len(args) != 1 {
+		return types.Value{}, fmt.Errorf("IMAGE_MIME requires 1 argument")
+	}
+
+	data, err := getImageData(args[0])
+	if err != nil {
+		return types.NewNullValue(), nil
+	}
+
+	info, err := parseImageInfo(data)
+	if err != nil {
+		return types.NewNullValue(), nil
+	}
+
+	return types.NewStringValue(info.Mime), nil
+}
+
+// Unused imports workaround - these are needed for image decoding
+var (
+	_ = png.Decode
+	_ = jpeg.Decode
+	_ = gif.Decode
+	_ = io.EOF
+)

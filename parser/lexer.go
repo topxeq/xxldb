@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // TokenType represents the type of a token
@@ -181,7 +182,7 @@ func (l *Lexer) NextToken() Token {
 	case r == '*':
 		l.next()
 		return Token{Type: TokStar, Value: "*", Pos: l.start}
-	case r == '=' || r == '<' || r == '>' || r == '!' || r == '|':
+	case r == '=' || r == '<' || r == '>' || r == '!' || r == '|' || r == '+' || r == '*' || r == '/' || r == '%':
 		return l.scanOperator()
 	case r == '-':
 		// Check for comment
@@ -427,7 +428,7 @@ func (l *Lexer) next() rune {
 	if l.pos >= len(l.input) {
 		return 0
 	}
-	r, w := rune(l.input[l.pos]), 1
+	r, w := utf8.DecodeRuneInString(l.input[l.pos:])
 	l.width = w
 	l.pos += w
 	return r
@@ -438,16 +439,23 @@ func (l *Lexer) peek() rune {
 	if l.pos >= len(l.input) {
 		return 0
 	}
-	return rune(l.input[l.pos])
+	r, _ := utf8.DecodeRuneInString(l.input[l.pos:])
+	return r
 }
 
 // peekAt returns the character at offset from current position
 func (l *Lexer) peekAt(offset int) rune {
-	pos := l.pos + offset
+	pos := l.pos
+	// Skip 'offset' characters
+	for i := 0; i < offset && pos < len(l.input); i++ {
+		_, w := utf8.DecodeRuneInString(l.input[pos:])
+		pos += w
+	}
 	if pos >= len(l.input) {
 		return 0
 	}
-	return rune(l.input[pos])
+	r, _ := utf8.DecodeRuneInString(l.input[pos:])
+	return r
 }
 
 // isLetter returns true if r is a letter
