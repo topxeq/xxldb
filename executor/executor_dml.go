@@ -396,3 +396,83 @@ func (e *Engine) executeRestore(stmt *parser.Statement) (*Result, error) {
 		Message:           fmt.Sprintf("Database would be restored from %s", stmt.FilePath),
 	}, nil
 }
+
+// ExecuteWithArgs executes a SQL statement with arguments for parameterized queries
+// This is useful for import operations that need to insert rows with values
+func (e *Engine) ExecuteWithArgs(sql string, args ...interface{}) (*Result, error) {
+	// Replace ? placeholders with actual values
+	processedSQL := e.replacePlaceholders(sql, args)
+	return e.Execute(processedSQL)
+}
+
+// replacePlaceholders replaces ? placeholders with actual values
+func (e *Engine) replacePlaceholders(sql string, args []interface{}) string {
+	result := sql
+	for _, arg := range args {
+		// Find first ? and replace it
+		idx := strings.Index(result, "?")
+		if idx == -1 {
+			break
+		}
+
+		var replacement string
+		switch v := arg.(type) {
+		case nil:
+			replacement = "NULL"
+		case string:
+			// Escape single quotes
+			escaped := strings.ReplaceAll(v, "'", "''")
+			replacement = fmt.Sprintf("'%s'", escaped)
+		case []byte:
+			// Convert bytes to hex or base64 representation
+			replacement = fmt.Sprintf("X'%x'", v)
+		case int, int32, int64:
+			replacement = fmt.Sprintf("%d", v)
+		case float32, float64:
+			replacement = fmt.Sprintf("%v", v)
+		case bool:
+			if v {
+				replacement = "1"
+			} else {
+				replacement = "0"
+			}
+		default:
+			// Try to convert to string
+			replacement = fmt.Sprintf("'%v'", v)
+		}
+
+		result = result[:idx] + replacement + result[idx+1:]
+	}
+	return result
+}
+
+// InsertRowDirect inserts a row directly into a table
+// This is more efficient for bulk imports as it bypasses SQL parsing
+func (e *Engine) InsertRowDirect(tableName string, values []interface{}) (uint64, error) {
+	tableInfo, err := e.storage.GetTableInfo(tableName)
+	if err != nil {
+		return 0, err
+	}
+
+	// Convert values to types.Value
+	row := make([]types.Value, len(tableInfo.Columns))
+	for i := 0; i < len(values) && i < len(row); i++ {
+		row[i] = types.NewValue(values[i])
+	}
+
+	// Fill remaining with defaults/nulls
+	for i := len(values); i < len(row); i++ {
+		if tableInfo.Columns[i].Default != nil {
+			row[i] = *tableInfo.Columns[i].Default
+		} else {
+			row[i] = types.NewNullValue()
+		}
+	}
+
+	id, _, err := e.storage.InsertRow(tableName, row)
+	if err != nil {
+		return 0, err
+	}
+
+	return id, nil
+}

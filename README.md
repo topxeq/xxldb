@@ -317,6 +317,81 @@ xxldb> .restore /path/to/backup
 RESTORE FROM '/path/to/backup';
 ```
 
+## Data Import
+
+XxLdb supports importing data from other databases including MySQL, PostgreSQL, SQLite, Oracle, and MS SQL Server.
+
+### Command Line Import
+
+```bash
+# Import single table from MySQL
+xxldb -db my.db -import "mysql://user:pass@localhost/dbname" -table users
+
+# Import all tables from PostgreSQL
+xxldb -db my.db -import "postgresql://user:pass@localhost/dbname" -import-all
+
+# Import from SQLite
+xxldb -db my.db -import "sqlite:///path/to/source.db" -import-all
+
+# Import from Oracle
+xxldb -db my.db -import "oracle://user:pass@host:1521/sid" -table employees -to staff
+
+# Import from MS SQL Server
+xxldb -db my.db -import "mssql://user:pass@host:1433/dbname" -import-all
+```
+
+### REPL Import
+
+```sql
+-- Import single table
+xxldb> .import mysql://user:pass@localhost/dbname users
+
+-- Import with different target table name
+xxldb> .import postgresql://user:pass@localhost/dbname old_table new_table
+
+-- Import all tables
+xxldb> .import-all sqlite:///path/to/source.db
+```
+
+### Import Options
+
+| Option | Description |
+|--------|-------------|
+| `-import <dsn>` | Source database connection string |
+| `-table <name>` | Source table to import |
+| `-to <name>` | Target table name (default: same as source) |
+| `-import-all` | Import all tables from source |
+| `-batch <size>` | Batch size for import (default: 1000) |
+| `-overwrite` | Overwrite existing tables |
+
+### Supported Constraints
+
+XxLdb imports the following constraints:
+
+| Constraint | MySQL | PostgreSQL | SQLite | Oracle | MSSQL |
+|------------|-------|------------|--------|--------|-------|
+| PRIMARY KEY | ✅ | ✅ | ✅ | ✅ | ✅ |
+| FOREIGN KEY | ✅ | ✅ | ✅ | ✅ | ✅ |
+| UNIQUE | ✅ | ✅ | ✅ | ✅ | ✅ |
+| CHECK | ✅ (8.0+) | ✅ | ✅ | ✅ | ✅ |
+| INDEX | ✅ | ✅ | ✅ | ✅ | ✅ |
+
+### Type Mapping
+
+Import automatically maps source database types to XxLdb types:
+
+| Source Type | XxLdb Type |
+|-------------|------------|
+| INT, INTEGER, BIGINT | INT |
+| FLOAT, DOUBLE, DECIMAL | FLOAT |
+| CHAR, NCHAR | CHAR |
+| VARCHAR, NVARCHAR | VARCHAR |
+| TEXT, CLOB | TEXT |
+| DATE | DATE |
+| TIME | TIME |
+| DATETIME, TIMESTAMP | DATETIME |
+| BLOB, BINARY | BLOB |
+
 ## Performance
 
 - Single table query: < 1ms (under 1000 rows)

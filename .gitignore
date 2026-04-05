@@ -42,3 +42,8 @@ tmp/
 # Backup files
 *.bak
 *.backup
+
+# Temp directories
+TO/
+xxldb.meta
+xxldb.wal

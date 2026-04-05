@@ -120,6 +120,13 @@ func (e *Engine) Close() error {
 	return e.storage.Close()
 }
 
+// ListTables returns a list of all tables in the database
+func (e *Engine) ListTables() []string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.storage.ListTables()
+}
+
 // Execute executes a SQL statement
 func (e *Engine) Execute(sql string) (*Result, error) {
 	stmt, err := parser.ParseString(sql)

@@ -317,6 +317,81 @@ xxldb> .restore /path/to/backup
 RESTORE FROM '/path/to/backup';
 ```
 
+## 数据导入
+
+XxLdb 支持从 MySQL、PostgreSQL、SQLite、Oracle 和 MS SQL Server 导入数据。
+
+### 命令行导入
+
+```bash
+# 从 MySQL 导入单个表
+xxldb -db my.db -import "mysql://user:pass@localhost/dbname" -table users
+
+# 从 PostgreSQL 导入所有表
+xxldb -db my.db -import "postgresql://user:pass@localhost/dbname" -import-all
+
+# 从 SQLite 导入
+xxldb -db my.db -import "sqlite:///path/to/source.db" -import-all
+
+# 从 Oracle 导入
+xxldb -db my.db -import "oracle://user:pass@host:1521/sid" -table employees -to staff
+
+# 从 MS SQL Server 导入
+xxldb -db my.db -import "mssql://user:pass@host:1433/dbname" -import-all
+```
+
+### REPL 导入
+
+```sql
+-- 导入单个表
+xxldb> .import mysql://user:pass@localhost/dbname users
+
+-- 导入并指定不同的目标表名
+xxldb> .import postgresql://user:pass@localhost/dbname old_table new_table
+
+-- 导入所有表
+xxldb> .import-all sqlite:///path/to/source.db
+```
+
+### 导入选项
+
+| 选项 | 说明 |
+|------|------|
+| `-import <dsn>` | 源数据库连接字符串 |
+| `-table <name>` | 要导入的源表 |
+| `-to <name>` | 目标表名（默认：与源表同名） |
+| `-import-all` | 导入源数据库中的所有表 |
+| `-batch <size>` | 导入批次大小（默认：1000） |
+| `-overwrite` | 覆盖已存在的表 |
+
+### 支持的约束
+
+XxLdb 导入时会保留以下约束：
+
+| 约束 | MySQL | PostgreSQL | SQLite | Oracle | MSSQL |
+|------|-------|------------|--------|--------|-------|
+| PRIMARY KEY | ✅ | ✅ | ✅ | ✅ | ✅ |
+| FOREIGN KEY | ✅ | ✅ | ✅ | ✅ | ✅ |
+| UNIQUE | ✅ | ✅ | ✅ | ✅ | ✅ |
+| CHECK | ✅ (8.0+) | ✅ | ✅ | ✅ | ✅ |
+| INDEX | ✅ | ✅ | ✅ | ✅ | ✅ |
+
+### 类型映射
+
+导入时自动将源数据库类型映射为 XxLdb 类型：
+
+| 源类型 | XxLdb 类型 |
+|--------|-----------|
+| INT, INTEGER, BIGINT | INT |
+| FLOAT, DOUBLE, DECIMAL | FLOAT |
+| CHAR, NCHAR | CHAR |
+| VARCHAR, NVARCHAR | VARCHAR |
+| TEXT, CLOB | TEXT |
+| DATE | DATE |
+| TIME | TIME |
+| DATETIME, TIMESTAMP | DATETIME |
+| BLOB, BINARY | BLOB |
+
 ## 性能特点
 
 - 单表查询: < 1ms (1000行以内)
