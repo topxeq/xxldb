@@ -2,6 +2,10 @@
 
 [中文文档](README_CN.md)
 
+[![Go Report Card](https://goreportcard.com/badge/github.com/topxeq/xxldb)](https://goreportcard.com/report/github.com/topxeq/xxldb)
+[![GoDoc](https://godoc.org/github.com/topxeq/xxldb?status.svg)](https://godoc.org/github.com/topxeq/xxldb)
+[![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A lightweight embedded SQL database implemented in pure Go.
 
 ## Features
@@ -321,9 +325,36 @@ RESTORE FROM '/path/to/backup';
 - Startup time: < 100ms
 - Memory usage: < 50MB (empty database)
 
+## Testing
+
+```bash
+# Run all tests
+go test ./...
+
+# Run tests with coverage
+go test -cover ./...
+
+# Run benchmark tests
+go test -bench=. ./...
+
+# Generate coverage report
+go test -coverprofile=coverage.out ./...
+go tool cover -html=coverage.out -o coverage.html
+```
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
+
+1. Fork the repository
+2. Create your feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add some amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
+
 ## License
 
-MIT License
+MIT License - see [LICENSE](LICENSE) for details.
 
 ## Author
 

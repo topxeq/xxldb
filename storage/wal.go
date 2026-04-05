@@ -26,6 +26,8 @@ const (
 	WALTypeCommit
 	WALTypeRollback
 	WALTypeCheckpoint
+	WALTypeRenameTable
+	WALTypeTruncateTable
 )
 
 // WALType represents the type of WAL record
@@ -52,6 +54,10 @@ func (t WALType) String() string {
 		return "ROLLBACK"
 	case WALTypeCheckpoint:
 		return "CHECKPOINT"
+	case WALTypeRenameTable:
+		return "RENAME_TABLE"
+	case WALTypeTruncateTable:
+		return "TRUNCATE_TABLE"
 	default:
 		return "UNKNOWN"
 	}

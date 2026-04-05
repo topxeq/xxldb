@@ -467,6 +467,114 @@ func (s *Storage) ListTables() []string {
 	return names
 }
 
+// RenameTable renames a table
+func (s *Storage) RenameTable(oldName, newName string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	info, exists := s.tables[oldName]
+	if !exists {
+		return fmt.Errorf("table %s does not exist", oldName)
+	}
+
+	if _, exists := s.tables[newName]; exists {
+		return fmt.Errorf("table %s already exists", newName)
+	}
+
+	// Update table info
+	info.Name = newName
+
+	// Move in tables map
+	delete(s.tables, oldName)
+	s.tables[newName] = info
+
+	// Move data file reference
+	if file, ok := s.dataFiles[oldName]; ok {
+		delete(s.dataFiles, oldName)
+		s.dataFiles[newName] = file
+	}
+
+	// Move row data
+	if data, ok := s.rowData[oldName]; ok {
+		delete(s.rowData, oldName)
+		s.rowData[newName] = data
+	}
+	if ids, ok := s.rowIDs[oldName]; ok {
+		delete(s.rowIDs, oldName)
+		s.rowIDs[newName] = ids
+	}
+
+	// Rename sequences
+	for _, col := range info.Columns {
+		if col.AutoInc || col.Type == types.TypeSeq {
+			oldSeqKey := oldName + "_" + col.Name
+			newSeqKey := newName + "_" + col.Name
+			if val, ok := s.sequences[oldSeqKey]; ok {
+				delete(s.sequences, oldSeqKey)
+				s.sequences[newSeqKey] = val
+			}
+		}
+	}
+
+	// Log to WAL
+	if s.enabled {
+		if err := s.writeWAL(WALRecord{
+			Type:    WALTypeRenameTable,
+			TableID: info.ID,
+			Data:    oldName + ":" + newName,
+		}); err != nil {
+			return err
+		}
+		if err := s.saveMetadata(); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// TruncateTable removes all rows from a table but keeps the table structure
+func (s *Storage) TruncateTable(name string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	info, exists := s.tables[name]
+	if !exists {
+		return fmt.Errorf("table %s does not exist", name)
+	}
+
+	// Clear row data
+	s.rowData[name] = make([][]types.Value, 0)
+	s.rowIDs[name] = make([]uint64, 0)
+
+	// Reset sequences
+	for _, col := range info.Columns {
+		if col.AutoInc || col.Type == types.TypeSeq {
+			s.sequences[name+"_"+col.Name] = 0
+		}
+	}
+
+	// Reset row count
+	info.RowCount = 0
+	info.UpdatedAt = time.Now()
+
+	// Log to WAL
+	if s.enabled {
+		if err := s.writeWAL(WALRecord{
+			Type:    WALTypeTruncateTable,
+			TableID: info.ID,
+			Data:    name,
+		}); err != nil {
+			return err
+		}
+		if err := s.saveMetadata(); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // InsertRow inserts a row into a table
 func (s *Storage) InsertRow(tableName string, row []types.Value) (uint64, int64, error) {
 	s.mu.Lock()

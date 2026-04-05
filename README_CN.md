@@ -2,6 +2,10 @@
 
 [English](README.md)
 
+[![Go Report Card](https://goreportcard.com/badge/github.com/topxeq/xxldb)](https://goreportcard.com/report/github.com/topxeq/xxldb)
+[![GoDoc](https://godoc.org/github.com/topxeq/xxldb?status.svg)](https://godoc.org/github.com/topxeq/xxldb)
+[![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 一个用纯 Go 语言实现的轻量级嵌入式 SQL 数据库。
 
 ## 特性
@@ -321,9 +325,36 @@ RESTORE FROM '/path/to/backup';
 - 启动时间: < 100ms
 - 内存占用: < 50MB (空数据库)
 
+## 测试
+
+```bash
+# 运行所有测试
+go test ./...
+
+# 运行测试并显示覆盖率
+go test -cover ./...
+
+# 运行基准测试
+go test -bench=. ./...
+
+# 生成覆盖率报告
+go test -coverprofile=coverage.out ./...
+go tool cover -html=coverage.out -o coverage.html
+```
+
+## 贡献
+
+欢迎贡献！请随时提交 Pull Request。
+
+1. Fork 本仓库
+2. 创建特性分支 (`git checkout -b feature/amazing-feature`)
+3. 提交更改 (`git commit -m 'Add some amazing feature'`)
+4. 推送到分支 (`git push origin feature/amazing-feature`)
+5. 创建 Pull Request
+
 ## 许可证
 
-MIT License
+MIT License - 详见 [LICENSE](LICENSE) 文件。
 
 ## 作者
 

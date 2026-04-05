@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -106,6 +107,38 @@ func init() {
 	Register("EXPORT_FOLDER", fnExportFolder)
 	Register("LIST_FOLDER", fnListFolder)
 	Register("FOLDER_FILES", fnFolderFiles)
+
+	// Additional numeric functions
+	Register("GCD", fnGcd)
+	Register("LCM", fnLcm)
+	Register("LOG", fnLog)
+	Register("LOG10", fnLog10)
+	Register("LOG2", fnLog2)
+	Register("EXP", fnExp)
+	Register("RADIANS", fnRadians)
+	Register("DEGREES", fnDegrees)
+	Register("SIN", fnSin)
+	Register("COS", fnCos)
+	Register("TAN", fnTan)
+	Register("RAND", fnRand)
+	Register("RANDOM", fnRand)
+
+	// Additional string functions
+	Register("CONCAT_WS", fnConcatWs)
+	Register("SPACE", fnSpace)
+	Register("STRCMP", fnStrcmp)
+
+	// Additional date functions
+	Register("MAKEDATE", fnMakeDate)
+	Register("MAKETIME", fnMakeTime)
+	Register("LAST_DAY", fnLastDay)
+	Register("QUARTER", fnQuarter)
+	Register("WEEK", fnWeek)
+	Register("DAYOFWEEK", fnDayOfWeek)
+	Register("DAYOFYEAR", fnDayOfYear)
+
+	// UUID function
+	Register("UUID", fnUuid)
 }
 
 // Register registers a function
@@ -489,7 +522,12 @@ func fnSign(args []types.Value) (types.Value, error) {
 	if err != nil {
 		return types.Value{}, err
 	}
-	return types.NewIntValue(int64(f / math.Abs(f))), nil
+	if f > 0 {
+		return types.NewIntValue(1), nil
+	} else if f < 0 {
+		return types.NewIntValue(-1), nil
+	}
+	return types.NewIntValue(0), nil
 }
 
 // ==================== Aggregate Functions ====================
@@ -1207,4 +1245,318 @@ func IsAggregate(name string) bool {
 func HasAggregate(expr string) bool {
 	re := regexp.MustCompile(`(?i)\b(COUNT|SUM|AVG|MIN|MAX)\s*\(`)
 	return re.MatchString(expr)
+}
+
+// ==================== Additional Numeric Functions ====================
+
+func fnGcd(args []types.Value) (types.Value, error) {
+	if len(args) != 2 {
+		return types.Value{}, fmt.Errorf("GCD requires 2 arguments")
+	}
+	if args[0].IsNull || args[1].IsNull {
+		return types.NewNullValue(), nil
+	}
+	a, _ := args[0].ToInt64()
+	b, _ := args[1].ToInt64()
+	return types.NewIntValue(gcd(a, b)), nil
+}
+
+func gcd(a, b int64) int64 {
+	for b != 0 {
+		a, b = b, a%b
+	}
+	return a
+}
+
+func fnLcm(args []types.Value) (types.Value, error) {
+	if len(args) != 2 {
+		return types.Value{}, fmt.Errorf("LCM requires 2 arguments")
+	}
+	if args[0].IsNull || args[1].IsNull {
+		return types.NewNullValue(), nil
+	}
+	a, _ := args[0].ToInt64()
+	b, _ := args[1].ToInt64()
+	return types.NewIntValue(lcm(a, b)), nil
+}
+
+func lcm(a, b int64) int64 {
+	return a * b / gcd(a, b)
+}
+
+func fnLog(args []types.Value) (types.Value, error) {
+	if len(args) < 1 {
+		return types.Value{}, fmt.Errorf("LOG requires at least 1 argument")
+	}
+	if args[0].IsNull {
+		return types.NewNullValue(), nil
+	}
+	x, _ := args[0].ToFloat64()
+	if len(args) == 1 {
+		return types.NewFloatValue(math.Log(x)), nil
+	}
+	// LOG(base, x) - logarithm with specified base
+	base, _ := args[1].ToFloat64()
+	return types.NewFloatValue(math.Log(x) / math.Log(base)), nil
+}
+
+func fnLog10(args []types.Value) (types.Value, error) {
+	if len(args) != 1 {
+		return types.Value{}, fmt.Errorf("LOG10 requires 1 argument")
+	}
+	if args[0].IsNull {
+		return types.NewNullValue(), nil
+	}
+	x, _ := args[0].ToFloat64()
+	return types.NewFloatValue(math.Log10(x)), nil
+}
+
+func fnLog2(args []types.Value) (types.Value, error) {
+	if len(args) != 1 {
+		return types.Value{}, fmt.Errorf("LOG2 requires 1 argument")
+	}
+	if args[0].IsNull {
+		return types.NewNullValue(), nil
+	}
+	x, _ := args[0].ToFloat64()
+	return types.NewFloatValue(math.Log2(x)), nil
+}
+
+func fnExp(args []types.Value) (types.Value, error) {
+	if len(args) != 1 {
+		return types.Value{}, fmt.Errorf("EXP requires 1 argument")
+	}
+	if args[0].IsNull {
+		return types.NewNullValue(), nil
+	}
+	x, _ := args[0].ToFloat64()
+	return types.NewFloatValue(math.Exp(x)), nil
+}
+
+func fnRadians(args []types.Value) (types.Value, error) {
+	if len(args) != 1 {
+		return types.Value{}, fmt.Errorf("RADIANS requires 1 argument")
+	}
+	if args[0].IsNull {
+		return types.NewNullValue(), nil
+	}
+	x, _ := args[0].ToFloat64()
+	return types.NewFloatValue(x * math.Pi / 180), nil
+}
+
+func fnDegrees(args []types.Value) (types.Value, error) {
+	if len(args) != 1 {
+		return types.Value{}, fmt.Errorf("DEGREES requires 1 argument")
+	}
+	if args[0].IsNull {
+		return types.NewNullValue(), nil
+	}
+	x, _ := args[0].ToFloat64()
+	return types.NewFloatValue(x * 180 / math.Pi), nil
+}
+
+func fnSin(args []types.Value) (types.Value, error) {
+	if len(args) != 1 {
+		return types.Value{}, fmt.Errorf("SIN requires 1 argument")
+	}
+	if args[0].IsNull {
+		return types.NewNullValue(), nil
+	}
+	x, _ := args[0].ToFloat64()
+	return types.NewFloatValue(math.Sin(x)), nil
+}
+
+func fnCos(args []types.Value) (types.Value, error) {
+	if len(args) != 1 {
+		return types.Value{}, fmt.Errorf("COS requires 1 argument")
+	}
+	if args[0].IsNull {
+		return types.NewNullValue(), nil
+	}
+	x, _ := args[0].ToFloat64()
+	return types.NewFloatValue(math.Cos(x)), nil
+}
+
+func fnTan(args []types.Value) (types.Value, error) {
+	if len(args) != 1 {
+		return types.Value{}, fmt.Errorf("TAN requires 1 argument")
+	}
+	if args[0].IsNull {
+		return types.NewNullValue(), nil
+	}
+	x, _ := args[0].ToFloat64()
+	return types.NewFloatValue(math.Tan(x)), nil
+}
+
+func fnRand(args []types.Value) (types.Value, error) {
+	return types.NewFloatValue(rand.Float64()), nil
+}
+
+// ==================== Additional String Functions ====================
+
+func fnConcatWs(args []types.Value) (types.Value, error) {
+	if len(args) < 2 {
+		return types.Value{}, fmt.Errorf("CONCAT_WS requires at least 2 arguments")
+	}
+	if args[0].IsNull {
+		return types.NewNullValue(), nil
+	}
+	sep := args[0].ToString()
+	var parts []string
+	for _, arg := range args[1:] {
+		if !arg.IsNull {
+			parts = append(parts, arg.ToString())
+		}
+	}
+	return types.NewStringValue(strings.Join(parts, sep)), nil
+}
+
+func fnSpace(args []types.Value) (types.Value, error) {
+	if len(args) != 1 {
+		return types.Value{}, fmt.Errorf("SPACE requires 1 argument")
+	}
+	if args[0].IsNull {
+		return types.NewNullValue(), nil
+	}
+	n, _ := args[0].ToInt64()
+	if n < 0 {
+		n = 0
+	}
+	return types.NewStringValue(strings.Repeat(" ", int(n))), nil
+}
+
+func fnStrcmp(args []types.Value) (types.Value, error) {
+	if len(args) != 2 {
+		return types.Value{}, fmt.Errorf("STRCMP requires 2 arguments")
+	}
+	if args[0].IsNull || args[1].IsNull {
+		return types.NewNullValue(), nil
+	}
+	s1 := args[0].ToString()
+	s2 := args[1].ToString()
+	if s1 < s2 {
+		return types.NewIntValue(-1), nil
+	} else if s1 > s2 {
+		return types.NewIntValue(1), nil
+	}
+	return types.NewIntValue(0), nil
+}
+
+// ==================== Additional Date Functions ====================
+
+func fnMakeDate(args []types.Value) (types.Value, error) {
+	if len(args) != 2 {
+		return types.Value{}, fmt.Errorf("MAKEDATE requires 2 arguments: year and dayofyear")
+	}
+	if args[0].IsNull || args[1].IsNull {
+		return types.NewNullValue(), nil
+	}
+	year, _ := args[0].ToInt64()
+	dayOfYear, _ := args[1].ToInt64()
+	t := time.Date(int(year), 1, 1, 0, 0, 0, 0, time.UTC).AddDate(0, 0, int(dayOfYear-1))
+	return types.NewDateValue(t), nil
+}
+
+func fnMakeTime(args []types.Value) (types.Value, error) {
+	if len(args) != 3 {
+		return types.Value{}, fmt.Errorf("MAKETIME requires 3 arguments: hour, minute, second")
+	}
+	if args[0].IsNull || args[1].IsNull || args[2].IsNull {
+		return types.NewNullValue(), nil
+	}
+	hour, _ := args[0].ToInt64()
+	minute, _ := args[1].ToInt64()
+	second, _ := args[2].ToFloat64()
+	sec := int(second)
+	nsec := int((second - float64(sec)) * 1e9)
+	t := time.Date(0, 1, 1, int(hour), int(minute), sec, nsec, time.UTC)
+	return types.NewDatetimeValue(t), nil
+}
+
+func fnLastDay(args []types.Value) (types.Value, error) {
+	if len(args) != 1 {
+		return types.Value{}, fmt.Errorf("LAST_DAY requires 1 argument")
+	}
+	if args[0].IsNull {
+		return types.NewNullValue(), nil
+	}
+	t, err := args[0].ToTime()
+	if err != nil {
+		return types.Value{}, err
+	}
+	// Get first day of next month, then subtract one day
+	nextMonth := t.AddDate(0, 1, -t.Day()+1)
+	lastDay := nextMonth.AddDate(0, 0, -1)
+	return types.NewDateValue(lastDay), nil
+}
+
+func fnQuarter(args []types.Value) (types.Value, error) {
+	if len(args) != 1 {
+		return types.Value{}, fmt.Errorf("QUARTER requires 1 argument")
+	}
+	if args[0].IsNull {
+		return types.NewNullValue(), nil
+	}
+	t, err := args[0].ToTime()
+	if err != nil {
+		return types.Value{}, err
+	}
+	month := t.Month()
+	quarter := (month-1)/3 + 1
+	return types.NewIntValue(int64(quarter)), nil
+}
+
+func fnWeek(args []types.Value) (types.Value, error) {
+	if len(args) != 1 {
+		return types.Value{}, fmt.Errorf("WEEK requires 1 argument")
+	}
+	if args[0].IsNull {
+		return types.NewNullValue(), nil
+	}
+	t, err := args[0].ToTime()
+	if err != nil {
+		return types.Value{}, err
+	}
+	_, week := t.ISOWeek()
+	return types.NewIntValue(int64(week)), nil
+}
+
+func fnDayOfWeek(args []types.Value) (types.Value, error) {
+	if len(args) != 1 {
+		return types.Value{}, fmt.Errorf("DAYOFWEEK requires 1 argument")
+	}
+	if args[0].IsNull {
+		return types.NewNullValue(), nil
+	}
+	t, err := args[0].ToTime()
+	if err != nil {
+		return types.Value{}, err
+	}
+	// Sunday = 1, Saturday = 7
+	return types.NewIntValue(int64(t.Weekday() + 1)), nil
+}
+
+func fnDayOfYear(args []types.Value) (types.Value, error) {
+	if len(args) != 1 {
+		return types.Value{}, fmt.Errorf("DAYOFYEAR requires 1 argument")
+	}
+	if args[0].IsNull {
+		return types.NewNullValue(), nil
+	}
+	t, err := args[0].ToTime()
+	if err != nil {
+		return types.Value{}, err
+	}
+	return types.NewIntValue(int64(t.YearDay())), nil
+}
+
+// ==================== UUID Function ====================
+
+func fnUuid(args []types.Value) (types.Value, error) {
+	uuid := make([]byte, 16)
+	rand.Read(uuid)
+	// Set version (4) and variant bits
+	uuid[6] = (uuid[6] & 0x0f) | 0x40
+	uuid[8] = (uuid[8] & 0x3f) | 0x80
+	return types.NewStringValue(fmt.Sprintf("%x-%x-%x-%x-%x", uuid[0:4], uuid[4:6], uuid[6:8], uuid[8:10], uuid[10:])), nil
 }
