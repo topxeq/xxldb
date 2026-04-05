@@ -22,7 +22,7 @@ func (p *Parser) parseInsert() (*Statement, error) {
 	if !p.match(TokIdent) {
 		return nil, fmt.Errorf("expected table name, got %s", p.current())
 	}
-	stmt.Table = p.advance().Value
+	stmt.Table = p.parseTableName()
 
 	// Column list
 	if p.match(TokLParen) {
@@ -115,7 +115,7 @@ func (p *Parser) parseUpdate() (*Statement, error) {
 	if !p.match(TokIdent) {
 		return nil, fmt.Errorf("expected table name, got %s", p.current())
 	}
-	stmt.Table = p.advance().Value
+	stmt.Table = p.parseTableName()
 
 	// SET clause
 	if err := p.expect(TokKeyword, "SET"); err != nil {
@@ -185,7 +185,7 @@ func (p *Parser) parseDelete() (*Statement, error) {
 	if !p.match(TokIdent) {
 		return nil, fmt.Errorf("expected table name, got %s", p.current())
 	}
-	stmt.Table = p.advance().Value
+	stmt.Table = p.parseTableName()
 
 	// WHERE clause
 	if p.matchKeyword("WHERE") {
@@ -216,6 +216,8 @@ func (p *Parser) parseCreate() (*Statement, error) {
 
 	if p.matchKeyword("TABLE") {
 		return p.parseCreateTable()
+	} else if p.matchKeyword("FULLTEXT") {
+		return p.parseCreateFullTextIndex()
 	} else if p.matchKeyword("INDEX") || p.matchKeyword("UNIQUE") {
 		return p.parseCreateIndex()
 	} else if p.matchKeyword("DATABASE") || p.matchKeyword("SCHEMA") {
@@ -247,7 +249,7 @@ func (p *Parser) parseCreateTable() (*Statement, error) {
 	if !p.match(TokIdent) {
 		return nil, fmt.Errorf("expected table name, got %s", p.current())
 	}
-	stmt.Table = p.advance().Value
+	stmt.Table = p.parseTableName()
 
 	// Column definitions
 	if err := p.expect(TokLParen, ""); err != nil {
@@ -439,7 +441,7 @@ func (p *Parser) parseConstraint() (*Constraint, error) {
 		if !p.match(TokIdent) {
 			return nil, fmt.Errorf("expected table name, got %s", p.current())
 		}
-		constraint.RefTable = p.advance().Value
+		constraint.RefTable = p.parseTableName()
 
 		// Referenced columns
 		if p.match(TokLParen) {
@@ -526,7 +528,7 @@ func (p *Parser) parseCreateIndex() (*Statement, error) {
 	if !p.match(TokIdent) {
 		return nil, fmt.Errorf("expected table name, got %s", p.current())
 	}
-	stmt.Table = p.advance().Value
+	stmt.Table = p.parseTableName()
 
 	// Column list
 	if err := p.expect(TokLParen, ""); err != nil {
@@ -553,13 +555,70 @@ func (p *Parser) parseCreateIndex() (*Statement, error) {
 func (p *Parser) parseCreateDatabase() (*Statement, error) {
 	p.advance() // Skip DATABASE or SCHEMA
 
-	stmt := &Statement{Type: StmtCreateTable} // Reuse for simplicity
+	stmt := &Statement{Type: StmtCreateDatabase}
+
+	// Check for IF NOT EXISTS
+	if p.matchKeyword("IF") {
+		p.advance() // Skip IF
+		if err := p.expect(TokKeyword, "NOT"); err != nil {
+			return nil, err
+		}
+		if err := p.expect(TokKeyword, "EXISTS"); err != nil {
+			return nil, err
+		}
+		stmt.IfNotExists = true
+	}
 
 	// Database name
 	if !p.match(TokIdent) {
 		return nil, fmt.Errorf("expected database name, got %s", p.current())
 	}
-	stmt.Table = p.advance().Value
+	stmt.Table = p.parseTableName()
+
+	return stmt, nil
+}
+
+// parseCreateFullTextIndex parses CREATE FULLTEXT INDEX statement
+func (p *Parser) parseCreateFullTextIndex() (*Statement, error) {
+	stmt := &Statement{
+		Type:         StmtCreateIndex,
+		IndexFullText: true,
+	}
+
+	p.advance() // Skip FULLTEXT
+
+	if err := p.expect(TokKeyword, "INDEX"); err != nil {
+		return nil, err
+	}
+
+	// Index name (optional)
+	if p.match(TokIdent) {
+		stmt.IndexName = p.advance().Value
+	}
+
+	// ON table
+	if err := p.expect(TokKeyword, "ON"); err != nil {
+		return nil, err
+	}
+
+	if !p.match(TokIdent) {
+		return nil, fmt.Errorf("expected table name, got %s", p.current())
+	}
+	stmt.Table = p.parseTableName()
+
+	// Column list
+	if err := p.expect(TokLParen, ""); err != nil {
+		return nil, err
+	}
+
+	if !p.match(TokIdent) {
+		return nil, fmt.Errorf("expected column name, got %s", p.current())
+	}
+	stmt.IndexCols = append(stmt.IndexCols, p.advance().Value)
+
+	if err := p.expect(TokRParen, ""); err != nil {
+		return nil, err
+	}
 
 	return stmt, nil
 }
@@ -591,14 +650,14 @@ func (p *Parser) parseDropTable() (*Statement, error) {
 		if err := p.expect(TokKeyword, "EXISTS"); err != nil {
 			return nil, err
 		}
-		stmt.IfNotExists = true // Reuse field
+		stmt.IfExists = true
 	}
 
 	// Table name
 	if !p.match(TokIdent) {
 		return nil, fmt.Errorf("expected table name, got %s", p.current())
 	}
-	stmt.Table = p.advance().Value
+	stmt.Table = p.parseTableName()
 
 	return stmt, nil
 }
@@ -621,7 +680,7 @@ func (p *Parser) parseDropIndex() (*Statement, error) {
 		if !p.match(TokIdent) {
 			return nil, fmt.Errorf("expected table name, got %s", p.current())
 		}
-		stmt.Table = p.advance().Value
+		stmt.Table = p.parseTableName()
 	}
 
 	return stmt, nil
@@ -631,13 +690,22 @@ func (p *Parser) parseDropIndex() (*Statement, error) {
 func (p *Parser) parseDropDatabase() (*Statement, error) {
 	p.advance() // Skip DATABASE or SCHEMA
 
-	stmt := &Statement{Type: StmtDropTable}
+	stmt := &Statement{Type: StmtDropDatabase}
+
+	// IF EXISTS
+	if p.matchKeyword("IF") {
+		p.advance()
+		if err := p.expect(TokKeyword, "EXISTS"); err != nil {
+			return nil, err
+		}
+		stmt.IfExists = true
+	}
 
 	// Database name
 	if !p.match(TokIdent) {
 		return nil, fmt.Errorf("expected database name, got %s", p.current())
 	}
-	stmt.Table = p.advance().Value
+	stmt.Table = p.parseTableName()
 
 	return stmt, nil
 }
@@ -656,7 +724,7 @@ func (p *Parser) parseAlter() (*Statement, error) {
 	if !p.match(TokIdent) {
 		return nil, fmt.Errorf("expected table name, got %s", p.current())
 	}
-	stmt.Table = p.advance().Value
+	stmt.Table = p.parseTableName()
 
 	// Parse alter actions
 	for {
@@ -799,15 +867,33 @@ func (p *Parser) parseShow() (*Statement, error) {
 
 	p.advance() // Skip SHOW
 
+	// Skip optional GLOBAL / SESSION modifier
+	if p.matchKeyword("GLOBAL") || p.matchKeyword("SESSION") {
+		p.advance()
+	}
+
+	// Check for optional FULL keyword
+	isFull := false
+	if p.matchKeyword("FULL") {
+		isFull = true
+		p.advance()
+	}
+
 	// What to show
 	if p.matchKeyword("TABLES") {
 		stmt.ShowType = "TABLES"
+		if isFull {
+			stmt.ShowType = "FULL TABLES"
+		}
 		p.advance()
 	} else if p.matchKeyword("DATABASES") {
 		stmt.ShowType = "DATABASES"
 		p.advance()
 	} else if p.matchKeyword("COLUMNS") {
 		stmt.ShowType = "COLUMNS"
+		if isFull {
+			stmt.ShowType = "FULL COLUMNS"
+		}
 		p.advance()
 		if p.matchKeyword("FROM") {
 			p.advance()
@@ -824,7 +910,104 @@ func (p *Parser) parseShow() (*Statement, error) {
 			if !p.match(TokIdent) {
 				return nil, fmt.Errorf("expected table name, got %s", p.current())
 			}
+			// Support db.table format: parse both parts, use only the table name
+			stmt.ShowTarget = p.parseTableName()
+		}
+	} else if p.matchKeyword("VARIABLES") {
+		stmt.ShowType = "VARIABLES"
+		p.advance()
+	} else if p.matchKeyword("STATUS") {
+		stmt.ShowType = "STATUS"
+		p.advance()
+	} else if p.matchKeyword("WARNINGS") {
+		stmt.ShowType = "WARNINGS"
+		p.advance()
+	} else if p.matchKeyword("GRANTS") {
+		stmt.ShowType = "GRANTS"
+		p.advance()
+	} else if p.matchKeyword("INDEX") || p.matchKeyword("INDEXES") || p.matchKeyword("KEYS") {
+		stmt.ShowType = "INDEX"
+		p.advance()
+		if p.matchKeyword("FROM") {
+			p.advance()
+			if !p.match(TokIdent) {
+				return nil, fmt.Errorf("expected table name, got %s", p.current())
+			}
 			stmt.ShowTarget = p.advance().Value
+		}
+	} else if p.matchKeyword("PROCESSLIST") {
+		stmt.ShowType = "PROCESSLIST"
+		p.advance()
+	} else if p.matchKeyword("ENGINES") || p.matchKeyword("ENGINE") {
+		stmt.ShowType = "ENGINES"
+		p.advance()
+	} else if p.matchKeyword("OPEN") {
+		// SHOW OPEN TABLES [FROM db] [WHERE ...]
+		stmt.ShowType = "OPEN TABLES"
+		for p.current().Type != TokEOF && p.current().Type != TokSemicolon {
+			p.advance()
+		}
+	} else if p.matchKeyword("COLLATION") {
+		stmt.ShowType = "COLLATION"
+		for p.current().Type != TokEOF && p.current().Type != TokSemicolon {
+			p.advance()
+		}
+	} else if p.matchKeyword("FUNCTION") {
+		p.advance()
+		if p.matchKeyword("STATUS") {
+			p.advance()
+		}
+		stmt.ShowType = "FUNCTION STATUS"
+		// skip optional WHERE clause
+		for p.current().Type != TokEOF && p.current().Type != TokSemicolon {
+			p.advance()
+		}
+	} else if p.matchKeyword("PROCEDURE") {
+		p.advance()
+		if p.matchKeyword("STATUS") {
+			p.advance()
+		}
+		stmt.ShowType = "PROCEDURE STATUS"
+		for p.current().Type != TokEOF && p.current().Type != TokSemicolon {
+			p.advance()
+		}
+	} else if p.matchKeyword("TRIGGERS") {
+		p.advance()
+		stmt.ShowType = "TRIGGERS"
+		if p.matchKeyword("FROM") || p.matchKeyword("IN") {
+			p.advance()
+			if p.match(TokIdent) {
+				stmt.ShowTarget = p.advance().Value
+			}
+		}
+		for p.current().Type != TokEOF && p.current().Type != TokSemicolon {
+			p.advance()
+		}
+	} else if p.matchKeyword("EVENTS") {
+		p.advance()
+		stmt.ShowType = "EVENTS"
+		for p.current().Type != TokEOF && p.current().Type != TokSemicolon {
+			p.advance()
+		}
+	} else if p.matchKeyword("TABLE") {
+		p.advance()
+		if p.matchKeyword("STATUS") {
+			stmt.ShowType = "TABLE STATUS"
+			p.advance()
+			// Handle FROM database clause
+			if p.matchKeyword("FROM") {
+				p.advance()
+				if p.match(TokIdent) {
+					stmt.ShowTarget = p.advance().Value
+				}
+			}
+			// Handle LIKE clause
+			if p.matchKeyword("LIKE") {
+				p.advance()
+				if p.match(TokString) {
+					stmt.ShowPattern = p.advance().Value
+				}
+			}
 		}
 	} else {
 		return nil, fmt.Errorf("unsupported SHOW statement: %s", p.current().Value)
@@ -843,7 +1026,22 @@ func (p *Parser) parseUse() (*Statement, error) {
 	if !p.match(TokIdent) {
 		return nil, fmt.Errorf("expected database name, got %s", p.current())
 	}
-	stmt.Table = p.advance().Value // Reuse Table field
+	stmt.Table = p.parseTableName() // Reuse Table field
+
+	return stmt, nil
+}
+
+// parseDescribe parses DESCRIBE/DESC statement
+func (p *Parser) parseDescribe() (*Statement, error) {
+	stmt := &Statement{Type: StmtDescribe}
+
+	p.advance() // Skip DESCRIBE or DESC
+
+	// Table name
+	if !p.match(TokIdent) {
+		return nil, fmt.Errorf("expected table name, got %s", p.current())
+	}
+	stmt.Table = p.parseTableName()
 
 	return stmt, nil
 }
@@ -899,6 +1097,18 @@ func (p *Parser) parseBegin() (*Statement, error) {
 
 	if p.matchKeyword("TRANSACTION") {
 		p.advance()
+	}
+
+	return stmt, nil
+}
+
+// parseStartTransaction parses START TRANSACTION statement
+func (p *Parser) parseStartTransaction() (*Statement, error) {
+	stmt := &Statement{Type: StmtBegin}
+	p.advance() // Skip START
+
+	if err := p.expect(TokKeyword, "TRANSACTION"); err != nil {
+		return nil, err
 	}
 
 	return stmt, nil

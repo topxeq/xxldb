@@ -54,12 +54,16 @@ func (p *Parser) Parse() (*Statement, error) {
 		return p.parseShow()
 	case "USE":
 		return p.parseUse()
+	case "DESCRIBE", "DESC":
+		return p.parseDescribe()
 	case "BACKUP":
 		return p.parseBackup()
 	case "RESTORE":
 		return p.parseRestore()
 	case "BEGIN":
 		return p.parseBegin()
+	case "START":
+		return p.parseStartTransaction()
 	case "COMMIT":
 		return p.parseCommit()
 	case "ROLLBACK":
@@ -126,6 +130,33 @@ func (p *Parser) match(typ TokenType, values ...string) bool {
 // matchKeyword checks if current token is a keyword
 func (p *Parser) matchKeyword(keywords ...string) bool {
 	return p.match(TokKeyword, keywords...)
+}
+
+// parseTableName parses a table name, handling database.table format
+// Returns just the table name (strips database prefix if present)
+func (p *Parser) parseTableName() string {
+	_, table := p.parseTableNameWithDB()
+	return table
+}
+
+// parseTableNameWithDB parses a table name, returning both database prefix (if any) and table name
+func (p *Parser) parseTableNameWithDB() (database string, table string) {
+	// Accept both identifiers and keywords as table names
+	if !p.match(TokIdent) && !p.match(TokKeyword) {
+		return "", ""
+	}
+	name := p.advance().Value
+
+	// Check for database.table format
+	if p.match(TokDot) {
+		p.advance() // Skip the dot
+		if p.match(TokIdent) || p.match(TokKeyword) {
+			// The second part is the actual table name
+			return name, p.advance().Value
+		}
+	}
+
+	return "", name
 }
 
 // parseSelect parses a SELECT statement
@@ -338,7 +369,7 @@ func (p *Parser) parseFromClause() (*FromClause, error) {
 		if !p.match(TokIdent) {
 			return nil, fmt.Errorf("expected table name, got %s", p.current())
 		}
-		from.Table = p.advance().Value
+		from.Database, from.Table = p.parseTableNameWithDB()
 	}
 
 	// Alias
@@ -389,7 +420,7 @@ func (p *Parser) parseJoinClause() (*JoinClause, error) {
 	if !p.match(TokIdent) {
 		return nil, fmt.Errorf("expected table name, got %s", p.current())
 	}
-	join.Table = p.advance().Value
+	join.Table = p.parseTableName()
 
 	// Alias
 	if p.matchKeyword("AS") {
@@ -592,6 +623,18 @@ func (p *Parser) parseInExpr(left *Expression) (*Expression, error) {
 		return nil, err
 	}
 
+	// Check for subquery: IN (SELECT ...)
+	if p.matchKeyword("SELECT") {
+		subq, err := p.parseSelect()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expect(TokRParen, ""); err != nil {
+			return nil, err
+		}
+		return &Expression{Type: ExprIn, Left: left, Subquery: subq}, nil
+	}
+
 	var list []*Expression
 	for {
 		expr, err := p.parseExpression()
@@ -721,6 +764,9 @@ func (p *Parser) parsePrimaryExpr() (*Expression, error) {
 		if strings.ToUpper(tok.Value) == "EXISTS" {
 			return p.parseExistsExpr()
 		}
+		if strings.ToUpper(tok.Value) == "MATCH" {
+			return p.parseMatchAgainst()
+		}
 		// Might be a function
 		return p.parseIdentOrFunction()
 	case TokIdent:
@@ -754,6 +800,75 @@ func (p *Parser) parseNumberLiteral() (*Expression, error) {
 		return nil, fmt.Errorf("invalid number: %s", value)
 	}
 	return NewLiteralExpr(f), nil
+}
+
+// parseMatchAgainst parses MATCH(column) AGAINST('query')
+func (p *Parser) parseMatchAgainst() (*Expression, error) {
+	p.advance() // Skip MATCH
+
+	// Open paren
+	if err := p.expect(TokLParen, ""); err != nil {
+		return nil, fmt.Errorf("expected ( after MATCH: %v", err)
+	}
+
+	// Column name
+	if !p.match(TokIdent) {
+		return nil, fmt.Errorf("expected column name in MATCH: %s", p.current())
+	}
+	column := p.advance().Value
+
+	// Close paren
+	if err := p.expect(TokRParen, ""); err != nil {
+		return nil, err
+	}
+
+	// AGAINST
+	if !p.matchKeyword("AGAINST") {
+		return nil, fmt.Errorf("expected AGAINST after MATCH(column): %s", p.current())
+	}
+	p.advance()
+
+	// Open paren
+	if err := p.expect(TokLParen, ""); err != nil {
+		return nil, err
+	}
+
+	// Query string
+	if !p.match(TokString) {
+		return nil, fmt.Errorf("expected search query string: %s", p.current())
+	}
+	query := p.advance().Value
+
+	// Optional mode: WITH QUERY EXPANSION or WITH BOOLEAN MODE
+	mode := ""
+	if p.matchKeyword("WITH") {
+		p.advance()
+		if p.matchKeyword("QUERY") {
+			p.advance()
+			if err := p.expect(TokKeyword, "EXPANSION"); err != nil {
+				return nil, err
+			}
+			mode = "QUERY EXPANSION"
+		} else if p.matchKeyword("BOOLEAN") {
+			p.advance()
+			if err := p.expect(TokKeyword, "MODE"); err != nil {
+				return nil, err
+			}
+			mode = "BOOLEAN"
+		}
+	}
+
+	// Close paren
+	if err := p.expect(TokRParen, ""); err != nil {
+		return nil, err
+	}
+
+	return &Expression{
+		Type:        ExprMatch,
+		MatchColumn: column,
+		MatchQuery:  query,
+		MatchMode:   mode,
+	}, nil
 }
 
 // parseIdentOrFunction parses an identifier or function call

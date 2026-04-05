@@ -20,6 +20,9 @@ const (
 	StmtAlterTable
 	StmtCreateIndex
 	StmtDropIndex
+	StmtCreateDatabase
+	StmtDropDatabase
+	StmtDescribe
 	StmtSet
 	StmtShow
 	StmtUse
@@ -51,6 +54,12 @@ func (t StatementType) String() string {
 		return "CREATE INDEX"
 	case StmtDropIndex:
 		return "DROP INDEX"
+	case StmtCreateDatabase:
+		return "CREATE DATABASE"
+	case StmtDropDatabase:
+		return "DROP DATABASE"
+	case StmtDescribe:
+		return "DESCRIBE"
 	case StmtSet:
 		return "SET"
 	case StmtShow:
@@ -103,8 +112,9 @@ type Statement struct {
 	// UPDATE
 	Updates    map[string]*Expression
 
-	// CREATE TABLE
+	// CREATE TABLE / DROP TABLE / CREATE DATABASE / DROP DATABASE
 	IfNotExists bool
+	IfExists    bool
 	ColumnDefs  []ColumnDef
 	Constraints []Constraint
 
@@ -112,9 +122,10 @@ type Statement struct {
 	AlterActions []AlterAction
 
 	// CREATE INDEX / DROP INDEX
-	IndexName   string
-	IndexCols   []string
-	IndexUnique bool
+	IndexName    string
+	IndexCols    []string
+	IndexUnique  bool
+	IndexFullText bool // FULLTEXT index
 
 	// SET
 	SetVar   string
@@ -123,6 +134,7 @@ type Statement struct {
 	// SHOW
 	ShowType string // TABLES, COLUMNS, etc.
 	ShowTarget string
+	ShowPattern string // LIKE pattern
 
 	// BACKUP / RESTORE
 	FilePath string
@@ -150,6 +162,7 @@ func (c SelectColumn) String() string {
 // FromClause represents a FROM clause
 type FromClause struct {
 	Table     string
+	Database  string // Database prefix (for db.table format)
 	Alias     string
 	Join      *JoinClause
 	Subquery  *Statement
@@ -270,6 +283,11 @@ type Expression struct {
 
 	// EXISTS
 	Exists bool
+
+	// MATCH...AGAINST (full-text search)
+	MatchColumn string      // Column name for MATCH
+	MatchQuery  string      // Search query
+	MatchMode   string      // Search mode: "" (default), "BOOLEAN", "QUERY EXPANSION"
 }
 
 // ExprType represents the type of expression
@@ -288,6 +306,7 @@ const (
 	ExprExists
 	ExprSubquery
 	ExprStar
+	ExprMatch // MATCH...AGAINST for full-text search
 )
 
 // String returns string representation
@@ -351,6 +370,12 @@ func (e *Expression) String() string {
 			return fmt.Sprintf("%s.*", e.Table)
 		}
 		return "*"
+		case ExprMatch:
+			mode := ""
+			if e.MatchMode != "" {
+				mode = " WITH " + e.MatchMode
+			}
+			return fmt.Sprintf("MATCH(%s) AGAINST('%s'%s)", e.MatchColumn, e.MatchQuery, mode)
 	default:
 		return ""
 	}

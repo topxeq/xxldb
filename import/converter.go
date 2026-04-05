@@ -16,8 +16,7 @@ func NewTypeConverter() *TypeConverter {
 
 // ConvertMySQLType converts MySQL type to XxLdb type
 func (c *TypeConverter) ConvertMySQLType(mysqlType string) (types.DataType, int) {
-	mysqlType = strings.ToUpper(mysqlType)
-	mysqlType = strings.TrimRight(mysqlType, " )")
+	mysqlType = strings.ToUpper(strings.TrimSpace(mysqlType))
 
 	// Remove length specifier for extraction
 	baseType := mysqlType
@@ -77,8 +76,8 @@ func (c *TypeConverter) ConvertMySQLType(mysqlType string) (types.DataType, int)
 
 // ConvertPostgreSQLType converts PostgreSQL type to XxLdb type
 func (c *TypeConverter) ConvertPostgreSQLType(pgType string) (types.DataType, int) {
-	pgType = strings.ToUpper(pgType)
-	pgType = strings.TrimRight(pgType, " )")
+	// pgType already uppercased
+	pgType = strings.ToUpper(strings.TrimSpace(pgType))
 
 	// Remove array suffix
 	pgType = strings.TrimSuffix(pgType, "[]")
@@ -188,8 +187,8 @@ func (c *TypeConverter) ConvertSQLiteType(sqliteType string) (types.DataType, in
 
 // ConvertOracleType converts Oracle type to XxLdb type
 func (c *TypeConverter) ConvertOracleType(oracleType string) (types.DataType, int) {
-	oracleType = strings.ToUpper(oracleType)
-	oracleType = strings.TrimRight(oracleType, " )")
+	// oracleType already uppercased
+	oracleType = strings.ToUpper(strings.TrimSpace(oracleType))
 
 	baseType := oracleType
 	if idx := strings.Index(oracleType, "("); idx > 0 {
@@ -247,8 +246,8 @@ func (c *TypeConverter) ConvertOracleType(oracleType string) (types.DataType, in
 
 // ConvertMSSQLType converts MS SQL Server type to XxLdb type
 func (c *TypeConverter) ConvertMSSQLType(mssqlType string) (types.DataType, int) {
-	mssqlType = strings.ToUpper(mssqlType)
-	mssqlType = strings.TrimRight(mssqlType, " )")
+	// mssqlType already uppercased
+	mssqlType = strings.ToUpper(strings.TrimSpace(mssqlType))
 
 	baseType := mssqlType
 	if idx := strings.Index(mssqlType, "("); idx > 0 {

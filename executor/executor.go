@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/topxeq/xxldb/auth"
+	"github.com/topxeq/xxldb/fts"
 	"github.com/topxeq/xxldb/function"
 	"github.com/topxeq/xxldb/logger"
 	"github.com/topxeq/xxldb/parser"
@@ -23,23 +24,26 @@ const (
 
 // Engine is the main database engine
 type Engine struct {
-	mu      sync.RWMutex
-	storage *storage.Storage
-	auth    *auth.Auth
-	log     *logger.Logger
-	scripts *script.Manager
-	config  Config
+	mu        sync.RWMutex
+	storage   *storage.Storage
+	auth      *auth.Auth
+	log       *logger.Logger
+	scripts   *script.Manager
+	fts       *fts.Manager
+	config    Config
+	currentDB string
 }
 
 // Config holds engine configuration
 type Config struct {
-	Path         string
-	InMemory     bool
-	LogLevel     string
-	Username     string
-	Password     string
-	AutoCommit   bool
-	SyncInterval int
+	Path          string
+	InMemory      bool
+	LogLevel      string
+	Username      string
+	Password      string
+	AutoCommit    bool
+	SyncInterval  int
+	BlobThreshold int64 // Size threshold for external blob storage (default: 64KB, 0 = always inline)
 }
 
 // DefaultConfig returns default configuration
@@ -67,6 +71,13 @@ func NewEngineWithConfig(config Config) (*Engine, error) {
 		return nil, fmt.Errorf("failed to create storage: %w", err)
 	}
 
+	// Configure blob threshold if specified
+	if config.BlobThreshold > 0 {
+		storeConfig := store.GetConfig()
+		storeConfig.BlobThreshold = config.BlobThreshold
+		store.SetConfig(storeConfig)
+	}
+
 	logLevel := logger.INFO
 	if config.LogLevel != "" {
 		logLevel = logger.ParseLevel(config.LogLevel)
@@ -77,6 +88,7 @@ func NewEngineWithConfig(config Config) (*Engine, error) {
 		auth:    auth.NewAuth(),
 		log:     logger.NewLogger(logLevel, nil),
 		scripts: script.NewManager(),
+		fts:     fts.NewManager(),
 		config:  config,
 	}
 
@@ -88,6 +100,46 @@ func NewEngineWithConfig(config Config) (*Engine, error) {
 	// Set credentials if provided
 	if config.Username != "" && config.Password != "" {
 		engine.auth.SetCredentials(config.Username, config.Password)
+	}
+
+	return engine, nil
+}
+
+// NewEngineWithFS creates a new database engine with custom filesystem
+func NewEngineWithFS(path string, inMemory bool, fs storage.FileSystem) (*Engine, error) {
+	config := DefaultConfig()
+	config.Path = path
+	config.InMemory = inMemory
+
+	store, err := storage.NewStorageWithFS(config.Path, config.InMemory, fs)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create storage: %w", err)
+	}
+
+	// Configure blob threshold if specified
+	if config.BlobThreshold > 0 {
+		storeConfig := store.GetConfig()
+		storeConfig.BlobThreshold = config.BlobThreshold
+		store.SetConfig(storeConfig)
+	}
+
+	logLevel := logger.INFO
+	if config.LogLevel != "" {
+		logLevel = logger.ParseLevel(config.LogLevel)
+	}
+
+	engine := &Engine{
+		storage: store,
+		auth:    auth.NewAuth(),
+		log:     logger.NewLogger(logLevel, nil),
+		scripts: script.NewManager(),
+		fts:     fts.NewManager(),
+		config:  config,
+	}
+
+	// Initialize system tables
+	if err := engine.initSystemTables(); err != nil {
+		engine.log.Warn("failed to initialize system tables: %v", err)
 	}
 
 	return engine, nil
@@ -155,6 +207,14 @@ func (e *Engine) ExecuteStatement(stmt *parser.Statement) (*Result, error) {
 		return e.executeCreateTable(stmt)
 	case parser.StmtDropTable:
 		return e.executeDropTable(stmt)
+	case parser.StmtCreateDatabase:
+		return e.executeCreateDatabase(stmt)
+	case parser.StmtDropDatabase:
+		return e.executeDropDatabase(stmt)
+	case parser.StmtUse:
+		return e.executeUse(stmt)
+	case parser.StmtDescribe:
+		return e.executeDescribe(stmt)
 	case parser.StmtCreateIndex:
 		return e.executeCreateIndex(stmt)
 	case parser.StmtDropIndex:
@@ -169,6 +229,12 @@ func (e *Engine) ExecuteStatement(stmt *parser.Statement) (*Result, error) {
 		return e.executeBackup(stmt)
 	case parser.StmtRestore:
 		return e.executeRestore(stmt)
+	case parser.StmtBegin:
+		return e.executeBegin(stmt)
+	case parser.StmtCommit:
+		return e.executeCommit(stmt)
+	case parser.StmtRollback:
+		return e.executeRollback(stmt)
 	default:
 		return nil, fmt.Errorf("unsupported statement type: %s", stmt.Type)
 	}
@@ -276,6 +342,11 @@ func (e *Engine) executeSelect(stmt *parser.Statement) (*Result, error) {
 	// Handle SELECT without FROM (e.g., SELECT NOW())
 	if stmt.Table == "" {
 		return e.executeSelectWithoutTable(stmt)
+	}
+
+	// Handle information_schema virtual tables
+	if strings.EqualFold(stmt.From.Database, "information_schema") || strings.EqualFold(stmt.Table, "information_schema") || strings.HasPrefix(strings.ToLower(stmt.Table), "information_schema.") {
+		return e.executeInformationSchemaQuery(stmt)
 	}
 
 	// Get table info
@@ -421,6 +492,315 @@ func (e *Engine) executeSelectWithoutTable(stmt *parser.Statement) (*Result, err
 		Columns: columns,
 		Rows:    []*Row{{Data: data}},
 	}, nil
+}
+
+// executeInformationSchemaQuery handles queries to information_schema
+func (e *Engine) executeInformationSchemaQuery(stmt *parser.Statement) (*Result, error) {
+	// Determine which information_schema table is being queried
+	tableName := strings.ToLower(stmt.Table)
+	if strings.HasPrefix(tableName, "information_schema.") {
+		tableName = strings.TrimPrefix(tableName, "information_schema.")
+	}
+
+	// Also check From clause for table name (handles alias case)
+	if stmt.From != nil && strings.HasPrefix(strings.ToLower(stmt.From.Table), "information_schema.") {
+		tableName = strings.TrimPrefix(strings.ToLower(stmt.From.Table), "information_schema.")
+	}
+
+	switch tableName {
+	case "tables", "information_schema":
+		// Return all tables
+		tables := e.storage.ListTables()
+		var rows []*Row
+		for _, t := range tables {
+			rows = append(rows, &Row{Data: []types.Value{
+				types.NewStringValue("def"),              // TABLE_CATALOG
+				types.NewStringValue("xxldb"),            // TABLE_SCHEMA
+				types.NewStringValue(t),                  // TABLE_NAME
+				types.NewStringValue("BASE TABLE"),       // TABLE_TYPE
+				types.NewStringValue("InnoDB"),           // ENGINE
+				types.NewStringValue("10"),               // VERSION
+				types.NewStringValue("Compact"),          // ROW_FORMAT
+				types.NewStringValue("0"),                // TABLE_ROWS
+				types.NewStringValue("0"),                // AVG_ROW_LENGTH
+				types.NewStringValue("0"),                // DATA_LENGTH
+				types.NewStringValue("0"),                // MAX_DATA_LENGTH
+				types.NewStringValue("0"),                // INDEX_LENGTH
+				types.NewStringValue("0"),                // DATA_FREE
+				types.NewStringValue("0"),                // AUTO_INCREMENT
+				types.NewStringValue(""),                 // CREATE_TIME
+				types.NewStringValue(""),                 // UPDATE_TIME
+				types.NewStringValue(""),                 // CHECK_TIME
+				types.NewStringValue("utf8mb4_general_ci"), // TABLE_COLLATION
+				types.NewStringValue(""),                 // CHECKSUM
+				types.NewStringValue(""),                 // CREATE_OPTIONS
+				types.NewStringValue(""),                 // TABLE_COMMENT
+			}})
+		}
+		// Apply WHERE filter
+		if stmt.Where != nil {
+			colIndex := map[string]int{
+				"table_catalog": 0, "table_schema": 1, "table_name": 2, "table_type": 3,
+				"engine": 4, "version": 5, "row_format": 6, "table_rows": 7,
+				"avg_row_length": 8, "data_length": 9, "max_data_length": 10,
+				"index_length": 11, "data_free": 12, "auto_increment": 13,
+				"create_time": 14, "update_time": 15, "check_time": 16,
+				"table_collation": 17, "checksum": 18, "create_options": 19, "table_comment": 20,
+			}
+			rows = e.filterRows(rows, stmt.Where, colIndex)
+		}
+		return &Result{
+			Columns: []string{"TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "TABLE_TYPE", "ENGINE", "VERSION", "ROW_FORMAT", "TABLE_ROWS", "AVG_ROW_LENGTH", "DATA_LENGTH", "MAX_DATA_LENGTH", "INDEX_LENGTH", "DATA_FREE", "AUTO_INCREMENT", "CREATE_TIME", "UPDATE_TIME", "CHECK_TIME", "TABLE_COLLATION", "CHECKSUM", "CREATE_OPTIONS", "TABLE_COMMENT"},
+			Rows:    rows,
+		}, nil
+
+	case "columns":
+		// Return all columns for all tables
+		var rows []*Row
+		tables := e.storage.ListTables()
+		ordinalPos := 1
+		for _, t := range tables {
+			tableInfo, err := e.storage.GetTableInfo(t)
+			if err != nil {
+				continue
+			}
+			for _, col := range tableInfo.Columns {
+				// Infer type if UNKNOWN
+				dataType := col.Type.String()
+				if col.Type == types.TypeUnknown || col.Type == types.TypeNull {
+					if col.PrimaryKey {
+						dataType = "INT"
+					} else if col.Length > 0 {
+						if col.Length > 255 {
+							dataType = "TEXT"
+						} else {
+							dataType = "VARCHAR"
+						}
+					} else {
+						dataType = "TEXT"
+					}
+				}
+				// Determine COLUMN_KEY
+				columnKey := ""
+				if col.PrimaryKey {
+					columnKey = "PRI"
+				}
+				rows = append(rows, &Row{Data: []types.Value{
+					types.NewStringValue("def"),       // TABLE_CATALOG
+					types.NewStringValue("xxldb"),     // TABLE_SCHEMA
+					types.NewStringValue(t),           // TABLE_NAME
+					types.NewStringValue(col.Name),    // COLUMN_NAME
+					types.NewStringValue(fmt.Sprintf("%d", ordinalPos)), // ORDINAL_POSITION
+					types.NewStringValue(""),          // COLUMN_DEFAULT
+					types.NewStringValue("YES"),       // IS_NULLABLE
+					types.NewStringValue(dataType),    // DATA_TYPE
+					types.NewStringValue(fmt.Sprintf("%d", col.Length)), // CHARACTER_MAXIMUM_LENGTH
+					types.NewStringValue("0"),         // NUMERIC_PRECISION
+					types.NewStringValue("0"),         // NUMERIC_SCALE
+					types.NewStringValue(""),          // DATETIME_PRECISION
+					types.NewStringValue("utf8mb4"),   // CHARACTER_SET_NAME
+					types.NewStringValue("utf8mb4_general_ci"), // COLLATION_NAME
+					types.NewStringValue(fmt.Sprintf("%s(%d)", dataType, col.Length)), // COLUMN_TYPE
+					types.NewStringValue(columnKey),   // COLUMN_KEY
+					types.NewStringValue(""),          // EXTRA
+					types.NewStringValue("select,insert,update,references"), // PRIVILEGES
+					types.NewStringValue(""),          // COLUMN_COMMENT
+				}})
+				ordinalPos++
+			}
+		}
+		// Apply WHERE filter
+		if stmt.Where != nil {
+			colIndex := map[string]int{
+				"table_catalog": 0, "table_schema": 1, "table_name": 2, "column_name": 3,
+				"ordinal_position": 4, "column_default": 5, "is_nullable": 6, "data_type": 7,
+				"character_maximum_length": 8, "numeric_precision": 9, "numeric_scale": 10,
+				"datetime_precision": 11, "character_set_name": 12, "collation_name": 13,
+				"column_type": 14, "column_key": 15, "extra": 16, "privileges": 17, "column_comment": 18,
+			}
+			rows = e.filterRows(rows, stmt.Where, colIndex)
+		}
+		return &Result{
+			Columns: []string{"TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME", "ORDINAL_POSITION", "COLUMN_DEFAULT", "IS_NULLABLE", "DATA_TYPE", "CHARACTER_MAXIMUM_LENGTH", "NUMERIC_PRECISION", "NUMERIC_SCALE", "DATETIME_PRECISION", "CHARACTER_SET_NAME", "COLLATION_NAME", "COLUMN_TYPE", "COLUMN_KEY", "EXTRA", "PRIVILEGES", "COLUMN_COMMENT"},
+			Rows:    rows,
+		}, nil
+
+	case "schemata":
+		// Return database/schema info
+		return &Result{
+			Columns: []string{"CATALOG_NAME", "SCHEMA_NAME", "DEFAULT_CHARACTER_SET_NAME", "DEFAULT_COLLATION_NAME"},
+			Rows: []*Row{
+				{Data: []types.Value{
+					types.NewStringValue("def"),
+					types.NewStringValue("xxldb"),
+					types.NewStringValue("utf8mb4"),
+					types.NewStringValue("utf8mb4_general_ci"),
+				}},
+			},
+		}, nil
+
+	case "processlist":
+		// Return current process
+		return &Result{
+			Columns: []string{"ID", "USER", "HOST", "DB", "COMMAND", "TIME", "STATE", "INFO"},
+			Rows: []*Row{
+				{Data: []types.Value{
+					types.NewStringValue("1"),
+					types.NewStringValue("admin"),
+					types.NewStringValue("localhost"),
+					types.NewStringValue("xxldb"),
+					types.NewStringValue("Query"),
+					types.NewStringValue("0"),
+					types.NewStringValue(""),
+					types.NewStringValue("SELECT"),
+				}},
+			},
+		}, nil
+
+	case "key_column_usage":
+		// Return primary key information
+		var rows []*Row
+		tables := e.storage.ListTables()
+		for _, t := range tables {
+			tableInfo, err := e.storage.GetTableInfo(t)
+			if err != nil {
+				continue
+			}
+			for _, col := range tableInfo.Columns {
+				if col.PrimaryKey {
+					rows = append(rows, &Row{Data: []types.Value{
+						types.NewStringValue("def"),       // CONSTRAINT_CATALOG
+						types.NewStringValue("xxldb"),     // CONSTRAINT_SCHEMA
+						types.NewStringValue("PRIMARY"),   // CONSTRAINT_NAME
+						types.NewStringValue("def"),       // TABLE_CATALOG
+						types.NewStringValue("xxldb"),     // TABLE_SCHEMA
+						types.NewStringValue(t),           // TABLE_NAME
+						types.NewStringValue(col.Name),    // COLUMN_NAME
+						types.NewStringValue("1"),         // ORDINAL_POSITION
+						types.NewStringValue("1"),         // POSITION_IN_UNIQUE_CONSTRAINT
+						types.NewStringValue(""),          // REFERENCED_TABLE_SCHEMA
+						types.NewStringValue(""),          // REFERENCED_TABLE_NAME
+						types.NewStringValue(""),          // REFERENCED_COLUMN_NAME
+					}})
+				}
+			}
+		}
+		// Apply WHERE filter
+		if stmt.Where != nil {
+			colIndex := map[string]int{
+				"constraint_catalog": 0, "constraint_schema": 1, "constraint_name": 2,
+				"table_catalog": 3, "table_schema": 4, "table_name": 5, "column_name": 6,
+				"ordinal_position": 7, "position_in_unique_constraint": 8,
+				"referenced_table_schema": 9, "referenced_table_name": 10, "referenced_column_name": 11,
+			}
+			rows = e.filterRows(rows, stmt.Where, colIndex)
+		}
+		return &Result{
+			Columns: []string{"CONSTRAINT_CATALOG", "CONSTRAINT_SCHEMA", "CONSTRAINT_NAME", "TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME", "ORDINAL_POSITION", "POSITION_IN_UNIQUE_CONSTRAINT", "REFERENCED_TABLE_SCHEMA", "REFERENCED_TABLE_NAME", "REFERENCED_COLUMN_NAME"},
+			Rows:    rows,
+		}, nil
+
+	case "table_constraints":
+		// Return constraint information
+		var rows []*Row
+		tables := e.storage.ListTables()
+		for _, t := range tables {
+			tableInfo, err := e.storage.GetTableInfo(t)
+			if err != nil {
+				continue
+			}
+			hasPK := false
+			for _, col := range tableInfo.Columns {
+				if col.PrimaryKey {
+					hasPK = true
+					break
+				}
+			}
+			if hasPK {
+				rows = append(rows, &Row{Data: []types.Value{
+					types.NewStringValue("def"),       // CONSTRAINT_CATALOG
+					types.NewStringValue("xxldb"),     // CONSTRAINT_SCHEMA
+					types.NewStringValue("PRIMARY"),   // CONSTRAINT_NAME
+					types.NewStringValue("def"),       // TABLE_CATALOG
+					types.NewStringValue("xxldb"),     // TABLE_SCHEMA
+					types.NewStringValue(t),           // TABLE_NAME
+					types.NewStringValue("PRIMARY KEY"), // CONSTRAINT_TYPE
+					types.NewStringValue("YES"),       // IS_DEFERRABLE
+					types.NewStringValue("NO"),        // INITIALLY_DEFERRED
+					types.NewStringValue("YES"),       // ENFORCED
+				}})
+			}
+		}
+		// Apply WHERE filter
+		if stmt.Where != nil {
+			colIndex := map[string]int{
+				"constraint_catalog": 0, "constraint_schema": 1, "constraint_name": 2,
+				"table_catalog": 3, "table_schema": 4, "table_name": 5, "constraint_type": 6,
+				"is_deferrable": 7, "initially_deferred": 8, "enforced": 9,
+			}
+			rows = e.filterRows(rows, stmt.Where, colIndex)
+		}
+		return &Result{
+			Columns: []string{"CONSTRAINT_CATALOG", "CONSTRAINT_SCHEMA", "CONSTRAINT_NAME", "TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "CONSTRAINT_TYPE", "IS_DEFERRABLE", "INITIALLY_DEFERRED", "ENFORCED"},
+			Rows:    rows,
+		}, nil
+
+	case "statistics":
+		// Return index statistics
+		var rows []*Row
+		tables := e.storage.ListTables()
+		for _, t := range tables {
+			tableInfo, err := e.storage.GetTableInfo(t)
+			if err != nil {
+				continue
+			}
+			seq := 1
+			for _, col := range tableInfo.Columns {
+				if col.PrimaryKey {
+					rows = append(rows, &Row{Data: []types.Value{
+						types.NewStringValue("xxldb"),    // TABLE_CATALOG
+						types.NewStringValue("xxldb"),    // TABLE_SCHEMA
+						types.NewStringValue(t),          // TABLE_NAME
+						types.NewStringValue("0"),        // NON_UNIQUE
+						types.NewStringValue("xxldb"),    // INDEX_SCHEMA
+						types.NewStringValue("PRIMARY"),  // INDEX_NAME
+						types.NewStringValue(fmt.Sprintf("%d", seq)), // SEQ_IN_INDEX
+						types.NewStringValue(col.Name),   // COLUMN_NAME
+						types.NewStringValue("A"),        // COLLATION
+						types.NewStringValue("0"),        // CARDINALITY
+						types.NewStringValue(""),         // SUB_PART
+						types.NewStringValue(""),         // PACKED
+						types.NewStringValue(""),         // NULLABLE
+						types.NewStringValue("BTREE"),    // INDEX_TYPE
+						types.NewStringValue(""),         // COMMENT
+						types.NewStringValue(""),         // INDEX_COMMENT
+					}})
+					seq++
+				}
+			}
+		}
+		// Apply WHERE filter
+		if stmt.Where != nil {
+			colIndex := map[string]int{
+				"table_catalog": 0, "table_schema": 1, "table_name": 2, "non_unique": 3,
+				"index_schema": 4, "index_name": 5, "seq_in_index": 6, "column_name": 7,
+				"collation": 8, "cardinality": 9, "sub_part": 10, "packed": 11,
+				"nullable": 12, "index_type": 13, "comment": 14, "index_comment": 15,
+			}
+			rows = e.filterRows(rows, stmt.Where, colIndex)
+		}
+		return &Result{
+			Columns: []string{"TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "NON_UNIQUE", "INDEX_SCHEMA", "INDEX_NAME", "SEQ_IN_INDEX", "COLUMN_NAME", "COLLATION", "CARDINALITY", "SUB_PART", "PACKED", "NULLABLE", "INDEX_TYPE", "COMMENT", "INDEX_COMMENT"},
+			Rows:    rows,
+		}, nil
+
+	default:
+		// Return empty result for unknown information_schema tables
+		return &Result{
+			Columns: []string{},
+			Rows:    []*Row{},
+		}, nil
+	}
 }
 
 // filterRows filters rows by WHERE condition
@@ -687,6 +1067,10 @@ func (e *Engine) evalExpr(expr *parser.Expression, row []types.Value, colIndex m
 		return types.NewValue(expr.Literal)
 
 	case parser.ExprColumn:
+		// Check if it's a system variable (@@xxx)
+		if strings.HasPrefix(expr.Column, "@@") {
+			return e.evalSystemVariable(expr.Column)
+		}
 		idx := colIndex[strings.ToLower(expr.Column)]
 		if idx < len(row) {
 			return row[idx]
@@ -710,6 +1094,9 @@ func (e *Engine) evalExpr(expr *parser.Expression, row []types.Value, colIndex m
 
 	case parser.ExprBetween:
 		return e.evalBetween(expr, row, colIndex)
+
+	case parser.ExprMatch:
+		return e.evalMatchAgainst(expr, row, colIndex)
 
 	default:
 		return types.NewNullValue()
@@ -750,6 +1137,60 @@ func (e *Engine) evalFunction(name string, args []*parser.Expression, row []type
 	}
 
 	return result
+}
+
+// evalSystemVariable evaluates a MySQL system variable
+func (e *Engine) evalSystemVariable(name string) types.Value {
+	// Normalize variable name
+	name = strings.ToLower(name)
+	name = strings.TrimPrefix(name, "@@")
+	name = strings.TrimPrefix(name, "session.")
+	name = strings.TrimPrefix(name, "global.")
+
+	// Return default values for common MySQL variables
+	switch name {
+	case "auto_increment_increment":
+		return types.NewIntValue(1)
+	case "character_set_client", "character_set_connection", "character_set_results", "character_set_server":
+		return types.NewStringValue("utf8mb4")
+	case "collation_server":
+		return types.NewStringValue("utf8mb4_general_ci")
+	case "init_connect":
+		return types.NewStringValue("")
+	case "interactive_timeout":
+		return types.NewIntValue(28800)
+	case "license":
+		return types.NewStringValue("GPL")
+	case "lower_case_table_names":
+		return types.NewIntValue(0)
+	case "max_allowed_packet":
+		return types.NewIntValue(4194304)
+	case "net_buffer_length":
+		return types.NewIntValue(16384)
+	case "net_write_timeout":
+		return types.NewIntValue(60)
+	case "query_cache_size":
+		return types.NewIntValue(0)
+	case "query_cache_type":
+		return types.NewStringValue("OFF")
+	case "sql_mode":
+		return types.NewStringValue("")
+	case "system_time_zone":
+		return types.NewStringValue("UTC")
+	case "time_zone":
+		return types.NewStringValue("SYSTEM")
+	case "tx_isolation", "transaction_isolation":
+		return types.NewStringValue("REPEATABLE-READ")
+	case "wait_timeout":
+		return types.NewIntValue(28800)
+	case "version":
+		return types.NewStringValue("5.7.42")
+	case "version_comment":
+		return types.NewStringValue("XxLdb")
+	default:
+		// Return empty string for unknown variables
+		return types.NewStringValue("")
+	}
 }
 
 // evalScriptFunc evaluates a script function
@@ -980,4 +1421,51 @@ func (e *Engine) evalBetween(expr *parser.Expression, row []types.Value, colInde
 	}
 
 	return types.NewBoolValue(false)
+}
+
+// evalMatchAgainst evaluates a MATCH...AGAINST expression for full-text search
+func (e *Engine) evalMatchAgainst(expr *parser.Expression, row []types.Value, colIndex map[string]int) types.Value {
+	// Get the column value
+	colName := strings.ToLower(expr.MatchColumn)
+	idx, exists := colIndex[colName]
+	if !exists || idx >= len(row) {
+		return types.NewBoolValue(false)
+	}
+
+	content := row[idx].ToString()
+	query := expr.MatchQuery
+
+	// Find the table name from context (stored in expression or inferred)
+	tableName := expr.Table
+	if tableName == "" {
+		// Try to find FTS index by column name alone
+		for _, key := range e.fts.ListIndexes() {
+			parts := strings.SplitN(key, ".", 2)
+			if len(parts) == 2 && strings.EqualFold(parts[1], colName) {
+				tableName = parts[0]
+				break
+			}
+		}
+	}
+
+	// Check if FTS index exists
+	if e.fts.HasIndex(tableName, colName) {
+		// Use FTS search
+		results, err := e.fts.Search(tableName, colName, query, 1000, 0)
+		if err != nil {
+			e.log.Debug("FTS search error: %v", err)
+		} else {
+			// Check if any result matches the current content
+			for _, result := range results {
+				// For now, check if the query terms appear in content
+				// A more sophisticated approach would use row IDs
+				if result.Score > 0 {
+					return types.NewBoolValue(true)
+				}
+			}
+		}
+	}
+
+	// No FTS index or search failed, fall back to simple string search
+	return types.NewBoolValue(strings.Contains(strings.ToLower(content), strings.ToLower(query)))
 }

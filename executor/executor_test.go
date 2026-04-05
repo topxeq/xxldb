@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -3202,4 +3203,194 @@ func BenchmarkEngineExecuteAggregate(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		engine.Execute("SELECT category, COUNT(*), SUM(value), AVG(value) FROM bench_agg GROUP BY category")
 	}
+}
+
+// TestExecutorBlobDirect tests direct BLOB insertion and retrieval
+func TestExecutorBlobDirect(t *testing.T) {
+	engine, err := NewEngine("", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+
+	// Create table with BLOB column
+	_, err = engine.Execute("CREATE TABLE blob_test (id SEQ, name VARCHAR(100), data BLOB)")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Insert BLOB directly using []byte
+	testData := []byte("This is test blob data with binary content: \x00\x01\x02\x03")
+	id, err := engine.InsertBlobDirect("blob_test", "data", testData)
+	if err != nil {
+		t.Fatalf("InsertBlobDirect failed: %v", err)
+	}
+	t.Logf("Inserted BLOB with ID: %d", id)
+
+	// Retrieve BLOB directly
+	retrieved, err := engine.GetBlobDirect("blob_test", "data", "id = 1")
+	if err != nil {
+		t.Fatalf("GetBlobDirect failed: %v", err)
+	}
+
+	if string(retrieved) != string(testData) {
+		t.Errorf("Expected %q, got %q", testData, retrieved)
+	}
+	t.Log("BLOB direct insert and retrieve successful")
+}
+
+// TestExecutorImageDirect tests direct IMAGE insertion and retrieval
+func TestExecutorImageDirect(t *testing.T) {
+	engine, err := NewEngine("", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+
+	// Create table with IMAGE column
+	_, err = engine.Execute("CREATE TABLE image_test (id SEQ, name VARCHAR(100), img IMAGE)")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create minimal PNG data
+	minimalPNG := []byte{
+		0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+		0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+		0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+		0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xde,
+		0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54,
+		0x08, 0xd7, 0x63, 0xf8, 0xff, 0xff, 0x3f, 0x00,
+		0x05, 0xfe, 0x02, 0xfe, 0xdc, 0xcc, 0x59, 0xe7,
+		0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44,
+		0xae, 0x42, 0x60, 0x82,
+	}
+
+	// Insert IMAGE directly
+	id, err := engine.InsertImageDirect("image_test", "img", minimalPNG)
+	if err != nil {
+		t.Fatalf("InsertImageDirect failed: %v", err)
+	}
+	t.Logf("Inserted IMAGE with ID: %d", id)
+
+	// Retrieve IMAGE directly
+	retrieved, err := engine.GetImageDirect("image_test", "img", "id = 1")
+	if err != nil {
+		t.Fatalf("GetImageDirect failed: %v", err)
+	}
+
+	if len(retrieved) != len(minimalPNG) {
+		t.Errorf("Expected %d bytes, got %d bytes", len(minimalPNG), len(retrieved))
+	}
+	t.Log("IMAGE direct insert and retrieve successful")
+}
+
+// TestExecutorBlobFromReader tests BLOB insertion from io.Reader
+func TestExecutorBlobFromReader(t *testing.T) {
+	engine, err := NewEngine("", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+
+	// Create table
+	_, err = engine.Execute("CREATE TABLE blob_reader_test (id SEQ, data BLOB)")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Insert from reader
+	reader := strings.NewReader("Data from io.Reader")
+	id, err := engine.InsertBlobDirect("blob_reader_test", "data", reader)
+	if err != nil {
+		t.Fatalf("InsertBlobDirect from reader failed: %v", err)
+	}
+	t.Logf("Inserted BLOB from reader with ID: %d", id)
+
+	// Verify
+	retrieved, err := engine.GetBlobDirect("blob_reader_test", "data", fmt.Sprintf("id = %d", id))
+	if err != nil {
+		t.Fatalf("GetBlobDirect failed: %v", err)
+	}
+
+	if string(retrieved) != "Data from io.Reader" {
+		t.Errorf("Expected 'Data from io.Reader', got %q", string(retrieved))
+	}
+	t.Log("BLOB from io.Reader works correctly")
+}
+
+// TestExecutorBlobFromHex tests BLOB insertion from hex string
+func TestExecutorBlobFromHex(t *testing.T) {
+	engine, err := NewEngine("", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+
+	// Create table
+	_, err = engine.Execute("CREATE TABLE blob_hex_test (id SEQ, data BLOB)")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Insert from hex string
+	hexStr := "48656c6c6f20576f726c64" // "Hello World" in hex
+	id, err := engine.InsertBlobDirect("blob_hex_test", "data", hexStr)
+	if err != nil {
+		t.Fatalf("InsertBlobDirect from hex failed: %v", err)
+	}
+	t.Logf("Inserted BLOB from hex with ID: %d", id)
+
+	// Verify
+	retrieved, err := engine.GetBlobDirect("blob_hex_test", "data", fmt.Sprintf("id = %d", id))
+	if err != nil {
+		t.Fatalf("GetBlobDirect failed: %v", err)
+	}
+
+	if string(retrieved) != "Hello World" {
+		t.Errorf("Expected 'Hello World', got %q", string(retrieved))
+	}
+	t.Log("BLOB from hex string works correctly")
+}
+
+// TestExecutorUpdateBlobDirect tests direct BLOB update
+func TestExecutorUpdateBlobDirect(t *testing.T) {
+	engine, err := NewEngine("", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+
+	// Create table
+	_, err = engine.Execute("CREATE TABLE blob_update_test (id SEQ, name VARCHAR(50), data BLOB)")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Insert initial data
+	id, err := engine.InsertBlobDirect("blob_update_test", "data", []byte("original data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Update BLOB
+	rowsAffected, err := engine.UpdateBlobDirect("blob_update_test", "data", []byte("updated data"), fmt.Sprintf("id = %d", id))
+	if err != nil {
+		t.Fatalf("UpdateBlobDirect failed: %v", err)
+	}
+
+	if rowsAffected != 1 {
+		t.Errorf("Expected 1 row affected, got %d", rowsAffected)
+	}
+
+	// Verify update
+	retrieved, err := engine.GetBlobDirect("blob_update_test", "data", fmt.Sprintf("id = %d", id))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(retrieved) != "updated data" {
+		t.Errorf("Expected 'updated data', got %q", string(retrieved))
+	}
+	t.Log("BLOB direct update works correctly")
 }

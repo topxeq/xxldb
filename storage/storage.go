@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/topxeq/xxldb/types"
 )
@@ -152,16 +153,19 @@ type Storage struct {
 	path     string
 	enabled  bool // false for in-memory mode
 
+	// FileSystem abstraction
+	fs       FileSystem
+
 	// Metadata
 	tables    map[string]*TableInfo
 	sequences map[string]int64
 	nextID    uint64
 
 	// Data storage
-	dataFiles map[string]*os.File   // Table name -> file
-	pages     map[uint64]*Page      // Page cache
+	dataFiles map[string]File        // Table name -> file
+	pages     map[uint64]*Page       // Page cache
 	rowData   map[string][][]types.Value // Table name -> rows (in-memory storage)
-	rowIDs    map[string][]uint64       // Table name -> row IDs
+	rowIDs    map[string][]uint64        // Table name -> row IDs
 
 	// WAL
 	walFile   *os.File
@@ -172,6 +176,16 @@ type Storage struct {
 
 	// Config
 	config Config
+
+	// Full-text search indexes: "table.column" -> index info
+	ftsIndexes map[string]*FTSIndexInfo
+}
+
+// FTSIndexInfo stores full-text index metadata
+type FTSIndexInfo struct {
+	TableName  string `json:"table_name"`
+	ColumnName string `json:"column_name"`
+	IndexName  string `json:"index_name"`
 }
 
 // Config holds storage configuration
@@ -180,6 +194,7 @@ type Config struct {
 	CheckpointInt  time.Duration // Checkpoint interval
 	BufferSize     int           // Page buffer size
 	AutoCheckpoint bool          // Enable auto checkpoint
+	BlobThreshold  int64         // Size threshold for external blob storage (default: 64KB, 0 = always inline)
 }
 
 // DefaultConfig returns the default configuration
@@ -189,6 +204,7 @@ func DefaultConfig() Config {
 		CheckpointInt:  time.Minute * 5,
 		BufferSize:     1000,
 		AutoCheckpoint: true,
+		BlobThreshold:  1024 * 1024 * 1024, // 1GB - blobs larger than this are stored in separate files
 	}
 }
 
@@ -200,20 +216,33 @@ type TableInfo struct {
 
 // NewStorage creates a new storage instance
 func NewStorage(path string, inMemory bool) (*Storage, error) {
+	return NewStorageWithFS(path, inMemory, nil)
+}
+
+// NewStorageWithFS creates a new storage instance with custom filesystem
+func NewStorageWithFS(path string, inMemory bool, fs FileSystem) (*Storage, error) {
 	s := &Storage{
 		path:       path,
 		enabled:    !inMemory,
 		tables:     make(map[string]*TableInfo),
 		sequences:  make(map[string]int64),
 		nextID:     1,
-		dataFiles:  make(map[string]*os.File),
+		dataFiles:  make(map[string]File),
 		pages:      make(map[uint64]*Page),
 		rowData:    make(map[string][][]types.Value),
 		rowIDs:     make(map[string][]uint64),
 		config:     DefaultConfig(),
+		ftsIndexes: make(map[string]*FTSIndexInfo),
 	}
 
 	if !inMemory && path != "" {
+		// Use provided filesystem or create local one
+		if fs == nil {
+			s.fs = NewLocalFS(path)
+		} else {
+			s.fs = fs
+		}
+
 		if err := s.initFileStorage(); err != nil {
 			return nil, err
 		}
@@ -225,23 +254,21 @@ func NewStorage(path string, inMemory bool) (*Storage, error) {
 // initFileStorage initializes file-based storage
 func (s *Storage) initFileStorage() error {
 	// Create directory if not exists
-	if err := os.MkdirAll(s.path, 0755); err != nil {
+	if err := s.fs.MkdirAll(s.path, PermDir); err != nil {
 		return fmt.Errorf("failed to create storage directory: %w", err)
 	}
 
 	// Create subdirectories
-	if err := os.MkdirAll(filepath.Join(s.path, DataDirName), 0755); err != nil {
+	if err := s.fs.MkdirAll(s.fs.Join(s.path, DataDirName), PermDir); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Join(s.path, BlobDirName), 0755); err != nil {
+	if err := s.fs.MkdirAll(s.fs.Join(s.path, BlobDirName), PermDir); err != nil {
 		return err
 	}
 
 	// Load existing metadata
 	if err := s.loadMetadata(); err != nil {
-		if !os.IsNotExist(err) {
-			return fmt.Errorf("failed to load metadata: %w", err)
-		}
+		// Non-fatal: metadata might not exist yet
 	}
 
 	// Always try to recover from WAL (if exists)
@@ -260,9 +287,13 @@ func (s *Storage) initFileStorage() error {
 
 // loadMetadata loads metadata from disk
 func (s *Storage) loadMetadata() error {
-	metaPath := filepath.Join(s.path, MetaFileName)
+	if s.fs == nil {
+		return nil
+	}
 
-	data, err := os.ReadFile(metaPath)
+	metaPath := s.fs.Join(s.path, MetaFileName)
+
+	data, err := s.fs.ReadFile(metaPath)
 	if err != nil {
 		return err
 	}
@@ -303,15 +334,15 @@ func (s *Storage) loadMetadata() error {
 
 // saveMetadata saves metadata to disk
 func (s *Storage) saveMetadata() error {
-	if !s.enabled {
+	if !s.enabled || s.fs == nil {
 		return nil
 	}
 
 	meta := struct {
-		Version   uint64               `json:"version"`
+		Version   uint64                `json:"version"`
 		Tables    map[string]*TableInfo `json:"tables"`
-		Sequences map[string]int64     `json:"sequences"`
-		NextID    uint64               `json:"next_id"`
+		Sequences map[string]int64      `json:"sequences"`
+		NextID    uint64                `json:"next_id"`
 	}{
 		Version:   CurrentVersion,
 		Tables:    s.tables,
@@ -324,14 +355,22 @@ func (s *Storage) saveMetadata() error {
 		return fmt.Errorf("failed to marshal metadata: %w", err)
 	}
 
-	metaPath := filepath.Join(s.path, MetaFileName)
-	tempPath := metaPath + ".tmp"
+	metaPath := s.fs.Join(s.path, MetaFileName)
 
-	if err := os.WriteFile(tempPath, data, 0644); err != nil {
+	// Use safe write (temp file + atomic rename)
+	if lfs, ok := s.fs.(*LocalFS); ok {
+		return lfs.SafeWriteFile(metaPath, data, PermFile)
+	}
+
+	// Generic safe write
+	tempPath := metaPath + ".tmp." + generateID()
+
+	if err := s.fs.WriteFile(tempPath, data, PermFile); err != nil {
 		return fmt.Errorf("failed to write metadata: %w", err)
 	}
 
-	if err := os.Rename(tempPath, metaPath); err != nil {
+	if err := s.fs.Rename(tempPath, metaPath); err != nil {
+		s.fs.Remove(tempPath)
 		return fmt.Errorf("failed to rename metadata file: %w", err)
 	}
 
@@ -409,8 +448,8 @@ func (s *Storage) DropTable(name string) error {
 
 	// Delete data file
 	if s.enabled && info.DataFile != "" {
-		dataPath := filepath.Join(s.path, DataDirName, info.DataFile)
-		os.Remove(dataPath)
+		dataPath := s.fs.Join(s.path, DataDirName, info.DataFile)
+		s.fs.Remove(dataPath)
 	}
 
 	// Clean up sequences
@@ -595,8 +634,8 @@ func (s *Storage) InsertRow(tableName string, row []types.Value) (uint64, int64,
 		// Handle CHAR type: pad with spaces to fixed length
 		if col.Type == types.TypeChar && col.Length > 0 && !row[i].IsNull {
 			strVal := row[i].ToString()
-			if len(strVal) > col.Length {
-				return 0, 0, fmt.Errorf("value too long for column '%s': max length %d, got %d", col.Name, col.Length, len(strVal))
+			if utf8.RuneCountInString(strVal) > col.Length {
+				return 0, 0, fmt.Errorf("value too long for column '%s': max length %d, got %d", col.Name, col.Length, utf8.RuneCountInString(strVal))
 			}
 			// Pad with trailing spaces to fixed length
 			if len(strVal) < col.Length {
@@ -608,14 +647,19 @@ func (s *Storage) InsertRow(tableName string, row []types.Value) (uint64, int64,
 		// Validate VARCHAR length constraint (no padding, just validation)
 		if col.Type == types.TypeVarchar && col.Length > 0 {
 			strVal := row[i].ToString()
-			if len(strVal) > col.Length {
-				return 0, 0, fmt.Errorf("value too long for column '%s': max length %d, got %d", col.Name, col.Length, len(strVal))
+			if utf8.RuneCountInString(strVal) > col.Length {
+				return 0, 0, fmt.Errorf("value too long for column '%s': max length %d, got %d", col.Name, col.Length, utf8.RuneCountInString(strVal))
 			}
 		}
 
 		// Validate NOT NULL constraint
 		if !col.Nullable && row[i].IsNull && !col.AutoInc && col.Type != types.TypeSeq {
 			return 0, 0, fmt.Errorf("column '%s' cannot be null", col.Name)
+		}
+
+		// Handle large BLOBs - store externally if above threshold
+		if s.enabled && s.config.BlobThreshold > 0 && (col.Type == types.TypeBlob || col.Type == types.TypeImage) {
+			row[i] = s.processBlobValue(row[i])
 		}
 	}
 
@@ -647,9 +691,9 @@ func (s *Storage) InsertRow(tableName string, row []types.Value) (uint64, int64,
 		}
 	}
 
-		// Store row data
-		s.rowData[tableName] = append(s.rowData[tableName], row)
-		s.rowIDs[tableName] = append(s.rowIDs[tableName], rowID)
+	// Store row data
+	s.rowData[tableName] = append(s.rowData[tableName], row)
+	s.rowIDs[tableName] = append(s.rowIDs[tableName], rowID)
 
 	info.RowCount++
 	info.UpdatedAt = time.Now()
@@ -662,6 +706,50 @@ func (s *Storage) InsertRow(tableName string, row []types.Value) (uint64, int64,
 	}
 
 	return rowID, lastInsertID, nil
+}
+
+// processBlobValue checks if a blob value should be stored externally
+// and returns either the original value or a blob reference
+func (s *Storage) processBlobValue(val types.Value) types.Value {
+	if val.IsNull {
+		return val
+	}
+
+	data, ok := val.Data.([]byte)
+	if !ok {
+		return val
+	}
+
+	// Check if blob size exceeds threshold
+	if int64(len(data)) > s.config.BlobThreshold {
+		// Store blob externally
+		blobID := s.nextID
+		s.nextID++
+
+		blobPath := s.getBlobPath(blobID)
+		blobDir := s.fs.Dir(blobPath)
+
+		// Create bucket directory if not exists
+		if err := s.fs.MkdirAll(blobDir, PermDir); err != nil {
+			// If we can't create the directory, store inline
+			return val
+		}
+
+		if err := s.fs.WriteFile(blobPath, data, PermFile); err != nil {
+			// If we can't write the file, store inline
+			return val
+		}
+
+		// Return a blob reference instead of the data
+		return types.NewBlobRefValue(blobID, int64(len(data)))
+	}
+
+	return val
+}
+
+// GetDataPath returns the data path
+func (s *Storage) GetDataPath() string {
+	return s.path
 }
 
 // Close closes the storage
@@ -794,6 +882,91 @@ func (s *Storage) GetRows(tableName string) ([][]types.Value, error) {
 	result := make([][]types.Value, len(rows))
 	for i, row := range rows {
 		result[i] = make([]types.Value, len(row))
+		for j, val := range row {
+			// Resolve blob references
+			result[i][j] = s.resolveBlobRef(val)
+		}
+	}
+
+	return result, nil
+}
+
+// RowWithID represents a row with its ID
+type RowWithID struct {
+	ID   uint64
+	Row  []types.Value
+}
+
+// GetRowsWithIDs gets all rows from a table with their IDs
+func (s *Storage) GetRowsWithIDs(tableName string) ([]RowWithID, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if _, exists := s.tables[tableName]; !exists {
+		return nil, fmt.Errorf("table %s does not exist", tableName)
+	}
+
+	rows, exists := s.rowData[tableName]
+	if !exists {
+		return []RowWithID{}, nil
+	}
+
+	rowIDs := s.rowIDs[tableName]
+	result := make([]RowWithID, len(rows))
+	for i, row := range rows {
+		result[i] = RowWithID{
+			ID:  rowIDs[i],
+			Row: make([]types.Value, len(row)),
+		}
+		for j, val := range row {
+			result[i].Row[j] = s.resolveBlobRef(val)
+		}
+	}
+
+	return result, nil
+}
+
+// resolveBlobRef resolves a blob reference to actual data
+// If the value is not a blob reference, returns the value as-is
+func (s *Storage) resolveBlobRef(val types.Value) types.Value {
+	if !val.IsBlobRef() || val.BlobRef == nil {
+		return val
+	}
+
+	// Load blob data from external storage
+	data, err := s.ReadBlob(val.BlobRef.ID)
+	if err != nil {
+		// If we can't load the blob, return the reference
+		return val
+	}
+
+	// Return a new value with the actual data
+	return types.Value{
+		Type:    val.Type,
+		Data:    data,
+		BlobRef: val.BlobRef, // Keep the reference for size info
+	}
+}
+
+// GetRowsWithoutBlobRefs gets all rows without resolving blob references
+// This is more efficient when you only need to check row structure or non-blob columns
+func (s *Storage) GetRowsWithoutBlobRefs(tableName string) ([][]types.Value, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if _, exists := s.tables[tableName]; !exists {
+		return nil, fmt.Errorf("table %s does not exist", tableName)
+	}
+
+	rows, exists := s.rowData[tableName]
+	if !exists {
+		return [][]types.Value{}, nil
+	}
+
+	// Return a copy to avoid race conditions
+	result := make([][]types.Value, len(rows))
+	for i, row := range rows {
+		result[i] = make([]types.Value, len(row))
 		copy(result[i], row)
 	}
 
@@ -875,8 +1048,8 @@ func (s *Storage) UpdateRowsWithFunc(tableName string, updateFunc func([]types.V
 		// Handle CHAR type: pad with spaces to fixed length
 		if col.Type == types.TypeChar && col.Length > 0 && !val.IsNull {
 			strVal := val.ToString()
-			if len(strVal) > col.Length {
-				return val, fmt.Errorf("value too long for column '%s': max length %d, got %d", col.Name, col.Length, len(strVal))
+			if utf8.RuneCountInString(strVal) > col.Length {
+				return val, fmt.Errorf("value too long for column '%s': max length %d, got %d", col.Name, col.Length, utf8.RuneCountInString(strVal))
 			}
 			// Pad with trailing spaces to fixed length
 			if len(strVal) < col.Length {
@@ -888,8 +1061,8 @@ func (s *Storage) UpdateRowsWithFunc(tableName string, updateFunc func([]types.V
 		// Validate VARCHAR length constraint
 		if col.Type == types.TypeVarchar && col.Length > 0 {
 			strVal := val.ToString()
-			if len(strVal) > col.Length {
-				return val, fmt.Errorf("value too long for column '%s': max length %d, got %d", col.Name, col.Length, len(strVal))
+			if utf8.RuneCountInString(strVal) > col.Length {
+				return val, fmt.Errorf("value too long for column '%s': max length %d, got %d", col.Name, col.Length, utf8.RuneCountInString(strVal))
 			}
 		}
 
@@ -1006,7 +1179,7 @@ func (s *Storage) ReadBlob(blobID uint64) ([]byte, error) {
 	}
 
 	blobPath := s.getBlobPath(blobID)
-	return os.ReadFile(blobPath)
+	return s.fs.ReadFile(blobPath)
 }
 
 // WriteBlob writes a blob to storage
@@ -1022,14 +1195,14 @@ func (s *Storage) WriteBlob(data []byte) (uint64, error) {
 	s.nextID++
 
 	blobPath := s.getBlobPath(blobID)
-	blobDir := filepath.Dir(blobPath)
+	blobDir := s.fs.Dir(blobPath)
 
 	// Create bucket directory if not exists
-	if err := os.MkdirAll(blobDir, 0755); err != nil {
+	if err := s.fs.MkdirAll(blobDir, PermDir); err != nil {
 		return 0, err
 	}
 
-	if err := os.WriteFile(blobPath, data, 0644); err != nil {
+	if err := s.fs.WriteFile(blobPath, data, PermFile); err != nil {
 		return 0, err
 	}
 
@@ -1043,7 +1216,7 @@ func (s *Storage) DeleteBlob(blobID uint64) error {
 	}
 
 	blobPath := s.getBlobPath(blobID)
-	return os.Remove(blobPath)
+	return s.fs.Remove(blobPath)
 }
 
 // getBlobPath returns the bucketed path for a blob
@@ -1057,11 +1230,12 @@ func (s *Storage) getBlobPath(blobID uint64) string {
 	bucket1 := idStr[0:2]
 	bucket2 := idStr[2:4]
 
-	return filepath.Join(s.path, BlobDirName, bucket1, bucket2, fmt.Sprintf("blob_%d.bin", blobID))
+	return s.fs.Join(s.path, BlobDirName, bucket1, bucket2, fmt.Sprintf("blob_%d.bin", blobID))
 }
 
 // ImportFile imports a file into the database
 func (s *Storage) ImportFile(filePath string) (uint64, error) {
+	// ImportFile reads from local filesystem and writes to database storage
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return 0, fmt.Errorf("failed to read file: %w", err)
@@ -1075,6 +1249,7 @@ func (s *Storage) ExportFile(blobID uint64, filePath string) error {
 	if err != nil {
 		return err
 	}
+	// ExportFile writes to local filesystem
 	return os.WriteFile(filePath, data, 0644)
 }
 
@@ -1103,6 +1278,113 @@ func (s *Storage) Stats() map[string]interface{} {
 		"next_id":    s.nextID,
 		"page_cache": len(s.pages),
 	}
+}
+
+// GetConfig returns the current storage configuration
+func (s *Storage) GetConfig() Config {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.config
+}
+
+// SetConfig updates the storage configuration
+func (s *Storage) SetConfig(config Config) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.config = config
+}
+
+// CreateFTSIndex creates a full-text search index
+func (s *Storage) CreateFTSIndex(tableName, columnName, indexName string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Check if table exists
+	if _, exists := s.tables[tableName]; !exists {
+		return fmt.Errorf("table %s does not exist", tableName)
+	}
+
+	// Check if column exists and is text type
+	tableInfo := s.tables[tableName]
+	colExists := false
+	for _, col := range tableInfo.Columns {
+		if strings.EqualFold(col.Name, columnName) {
+			if col.Type.IsString() || col.Type == types.TypeText {
+				colExists = true
+			} else {
+				return fmt.Errorf("column %s is not a text column", columnName)
+			}
+			break
+		}
+	}
+	if !colExists {
+		return fmt.Errorf("column %s does not exist in table %s", columnName, tableName)
+	}
+
+	// Check if index already exists
+	key := tableName + "." + columnName
+	if _, exists := s.ftsIndexes[key]; exists {
+		return fmt.Errorf("full-text index already exists on %s.%s", tableName, columnName)
+	}
+
+	// Create index info
+	s.ftsIndexes[key] = &FTSIndexInfo{
+		TableName:  tableName,
+		ColumnName: columnName,
+		IndexName:  indexName,
+	}
+
+	// Save metadata
+	if s.enabled {
+		if err := s.saveMetadata(); err != nil {
+			delete(s.ftsIndexes, key)
+			return err
+		}
+	}
+
+	return nil
+}
+
+// DropFTSIndex drops a full-text search index
+func (s *Storage) DropFTSIndex(tableName, columnName string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	key := tableName + "." + columnName
+	if _, exists := s.ftsIndexes[key]; !exists {
+		return fmt.Errorf("full-text index does not exist on %s.%s", tableName, columnName)
+	}
+
+	delete(s.ftsIndexes, key)
+
+	if s.enabled {
+		if err := s.saveMetadata(); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// GetFTSIndexes returns all FTS indexes
+func (s *Storage) GetFTSIndexes() map[string]*FTSIndexInfo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	result := make(map[string]*FTSIndexInfo)
+	for k, v := range s.ftsIndexes {
+		result[k] = v
+	}
+	return result
+}
+
+// HasFTSIndex checks if an FTS index exists
+func (s *Storage) HasFTSIndex(tableName, columnName string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	_, exists := s.ftsIndexes[tableName+"."+columnName]
+	return exists
 }
 
 // Reader returns an io.Reader for a blob

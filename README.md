@@ -13,6 +13,7 @@ A lightweight embedded SQL database implemented in pure Go.
 - **Pure Go Implementation** - No CGO dependencies, cross-platform support (Linux/macOS/Windows)
 - **Full SQL Support** - SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER
 - **JOIN and UNION** - INNER/LEFT/RIGHT JOIN and UNION operations
+- **Full-Text Search** - Full-text indexing and MATCH...AGAINST search
 - **Built-in Functions** - String, numeric, date, aggregate, and image functions
 - **Script Functions** - Custom script functions with `xx_` prefix
 - **File Storage** - BLOB, FILE and IMAGE types for storing files/images/folders
@@ -176,6 +177,83 @@ SELECT EXPORT_FOLDER(data, '/tmp/restored_project') FROM folders WHERE name = 'm
 - Folder structure stored in JSON format within BLOB
 - File size limit configurable via `MaxFileSize` in config (default: unlimited)
 
+## Full-Text Search
+
+XxLdb provides full-text search capabilities using inverted indexes with TF-IDF scoring.
+
+### Creating Full-Text Index
+
+```sql
+-- Create table with text content
+CREATE TABLE articles (
+    id SEQ,
+    title VARCHAR(200),
+    content TEXT
+);
+
+-- Create full-text index on content column
+CREATE FULLTEXT INDEX idx_content ON articles(content);
+
+-- Create multiple full-text indexes
+CREATE FULLTEXT INDEX idx_title ON articles(title);
+CREATE FULLTEXT INDEX idx_body ON articles(body);
+```
+
+### Full-Text Search Query
+
+Use `MATCH...AGAINST` syntax for full-text search:
+
+```sql
+-- Search for documents containing 'database'
+SELECT * FROM articles WHERE MATCH(content) AGAINST('database');
+
+-- Search for multiple terms (AND search - all terms must match)
+SELECT * FROM articles WHERE MATCH(content) AGAINST('database programming');
+
+-- Search with ORDER BY for relevance ranking
+SELECT id, title FROM articles 
+WHERE MATCH(content) AGAINST('full-text search') 
+ORDER BY id DESC;
+```
+
+### How It Works
+
+- **Inverted Index**: Text is tokenized and indexed using an inverted index structure
+- **TF-IDF Scoring**: Results are ranked using simplified TF-IDF scoring
+- **AND Search**: Multiple search terms are combined with AND logic
+- **Unicode Support**: Full support for Unicode text including Chinese, Japanese, etc.
+
+### Automatic Index Maintenance
+
+Full-text indexes are automatically updated when data changes:
+
+```sql
+-- Insert - automatically indexed
+INSERT INTO articles (title, content) VALUES ('Introduction', 'This is about databases');
+
+-- Update - index is updated
+UPDATE articles SET content = 'Updated content about programming' WHERE id = 1;
+
+-- Delete - removed from index
+DELETE FROM articles WHERE id = 1;
+```
+
+### FTS API
+
+```go
+// Create full-text index programmatically
+engine, _ := xxldb.Open("/path/to/db")
+engine.Execute("CREATE FULLTEXT INDEX idx_content ON mytable(content)")
+
+// Check if index exists
+hasIndex := engine.FTS().HasIndex("mytable", "content")
+
+// Get index statistics
+indexer := engine.FTS().GetIndex("mytable", "content")
+stats := indexer.Stats()
+fmt.Printf("Documents: %d, Terms: %d\n", stats.DocumentCount, stats.TermCount)
+```
+
 ## Command Line Client
 
 ```bash
@@ -252,8 +330,10 @@ xxldb -db /path/to/db -user admin -password secret
 ### Image Functions
 - `LOAD_IMAGE(path)` - Load image from file
 - `IMAGE_FROM_BASE64(str)` - Create image from BASE64 string
+- `IMAGE_FROM_HEX(str)` - Create image from hex string (supports 0x prefix)
 - `IMAGE_TO_BASE64(img)` - Convert image to BASE64
 - `IMAGE_TO_BASE64(img, 'datauri')` - Convert to Data URI format
+- `IMAGE_TO_HEX(img)` - Convert image to hex string
 - `IMAGE_WIDTH(img)` - Get image width
 - `IMAGE_HEIGHT(img)` - Get image height
 - `IMAGE_FORMAT(img)` - Get image format (png/jpeg/gif/...)
@@ -270,6 +350,9 @@ INSERT INTO photos (name, img) VALUES ('sunset', LOAD_IMAGE('/path/to/sunset.jpg
 -- Load from BASE64
 INSERT INTO photos (name, img) VALUES ('avatar', IMAGE_FROM_BASE64('iVBORw0KGgo...'));
 
+-- Load from hex string
+INSERT INTO photos (name, img) VALUES ('icon', IMAGE_FROM_HEX('89504e470d0a...'));
+
 -- Load from Data URI
 INSERT INTO photos (name, img) VALUES ('logo', IMAGE_FROM_BASE64('data:image/png;base64,iVBORw0KGgo...'));
 
@@ -278,6 +361,117 @@ SELECT name, IMAGE_WIDTH(img), IMAGE_HEIGHT(img), IMAGE_FORMAT(img) FROM photos;
 
 -- Export as Data URI (for HTML embedding)
 SELECT name, IMAGE_TO_BASE64(img, 'datauri') FROM photos;
+
+-- Export as hex string
+SELECT name, IMAGE_TO_HEX(img) FROM photos;
+```
+
+### BLOB Functions
+- `BLOB_FROM_BASE64(str)` - Create BLOB from BASE64 string
+- `BLOB_FROM_HEX(str)` - Create BLOB from hex string (supports 0x prefix)
+- `BLOB_TO_BASE64(blob)` - Convert BLOB to BASE64 string
+- `BLOB_TO_HEX(blob)` - Convert BLOB to hex string
+
+#### BLOB Example
+```sql
+CREATE TABLE files (id SEQ, name VARCHAR(100), data BLOB);
+
+-- Insert from BASE64
+INSERT INTO files (name, data) VALUES ('config', BLOB_FROM_BASE64('SGVsbG8gV29ybGQh'));
+
+-- Insert from hex
+INSERT INTO files (name, data) VALUES ('binary', BLOB_FROM_HEX('48656c6c6f'));
+
+-- Insert from hex with 0x prefix
+INSERT INTO files (name, data) VALUES ('binary2', BLOB_FROM_HEX('0x48656c6c6f'));
+
+-- Export as BASE64
+SELECT name, BLOB_TO_BASE64(data) FROM files;
+
+-- Export as hex
+SELECT name, BLOB_TO_HEX(data) FROM files;
+```
+
+### Embedded BLOB/IMAGE API
+
+When using XxLdb as an embedded library, you can work with BLOB and IMAGE data directly from Go code:
+
+#### Using the Driver
+
+```go
+import (
+    "database/sql"
+    "io"
+    "strings"
+    
+    _ "github.com/topxeq/xxldb/driver"
+)
+
+// Insert BLOB from []byte
+data := []byte("binary data")
+db.Exec("INSERT INTO files (name, data) VALUES (?, ?)", "test", driver.NewBlob(data))
+
+// Insert IMAGE from []byte
+imgData := []byte{0x89, 0x50, 0x4e, 0x47, ...} // PNG data
+db.Exec("INSERT INTO photos (name, img) VALUES (?, ?)", "photo", driver.NewImage(imgData))
+
+// Insert from io.Reader
+reader := strings.NewReader("data from reader")
+blob, _ := driver.BlobFromReader(reader)
+db.Exec("INSERT INTO files (name, data) VALUES (?, ?)", "from_reader", blob)
+
+// Insert from io.Reader for IMAGE
+imgReader := openImageFile() // returns io.Reader
+img, _ := driver.ImageFromReader(imgReader)
+db.Exec("INSERT INTO photos (name, img) VALUES (?, ?)", "photo", img)
+```
+
+#### Using the Engine Directly
+
+```go
+import "github.com/topxeq/xxldb/executor"
+
+engine, _ := executor.NewEngine("/path/to/db", false)
+
+// Insert BLOB directly (accepts []byte, io.Reader, or hex string)
+id, _ := engine.InsertBlobDirect("files", "data", []byte("binary data"))
+id, _ = engine.InsertBlobDirect("files", "data", "48656c6c6f") // hex string
+id, _ = engine.InsertBlobDirect("files", "data", reader) // io.Reader
+
+// Insert IMAGE directly
+id, _ := engine.InsertImageDirect("photos", "img", imageData)
+
+// Retrieve BLOB/IMAGE directly
+data, _ := engine.GetBlobDirect("files", "data", "id = 1")
+imgData, _ := engine.GetImageDirect("photos", "img", "id = 1")
+
+// Update BLOB/IMAGE directly
+engine.UpdateBlobDirect("files", "data", newData, "id = 1")
+engine.UpdateImageDirect("photos", "img", newImgData, "id = 1")
+```
+
+#### Using the types Package
+
+```go
+import "github.com/topxeq/xxldb/types"
+import "strings"
+
+// Create BLOB value from []byte
+blobVal := types.NewBlobValue([]byte("data"))
+
+// Create IMAGE value from []byte
+imgVal := types.NewImageValue(imageBytes)
+
+// Create from io.Reader
+blobVal, _ = types.NewBlobValueFromReader(reader)
+imgVal, _ = types.NewImageValueFromReader(reader)
+
+// Create from hex string
+blobVal, _ = types.NewBlobValueFromHex("48656c6c6f")
+imgVal, _ = types.NewImageValueFromHex("89504e47...")
+
+// Convert to hex string
+hexStr, _ := blobVal.ToHex()
 ```
 
 ## Script Functions
@@ -309,6 +503,8 @@ xxldb/
 │   └── ast.go         # AST definitions
 ├── executor/          # Query executor
 ├── function/          # Built-in functions
+├── fts/               # Full-text search
+│   └── fts.go         # FTS manager and inverted index
 ├── script/            # Script functions
 ├── auth/              # Authentication module
 ├── logger/            # Logging module
@@ -320,15 +516,33 @@ xxldb/
 
 ```go
 config := xxldb.Config{
-    Path:         "/path/to/db",    // Database path
-    InMemory:     false,            // In-memory mode
-    LogLevel:     "INFO",           // Log level
-    Username:     "admin",          // Username
-    Password:     "secret",         // Password
-    AutoCommit:   true,             // Auto commit
-    SyncInterval: 1000,             // Sync interval (ms)
+    Path:          "/path/to/db",       // Database path
+    InMemory:      false,               // In-memory mode
+    LogLevel:      "INFO",              // Log level
+    Username:      "admin",             // Username
+    Password:      "secret",            // Password
+    AutoCommit:    true,                // Auto commit
+    SyncInterval:  1000,                // Sync interval (ms)
+    BlobThreshold: 1024 * 1024 * 1024,  // Blob size threshold (default: 1GB)
 }
 engine, err := xxldb.OpenWithConfig(config)
+```
+
+### Blob Storage Threshold
+
+XxLdb automatically stores large BLOBs in separate files to reduce memory usage:
+
+- **Default threshold**: 1GB (1073741824 bytes)
+- **Blobs larger than threshold**: Stored in `blobs/` directory
+- **Blobs smaller than threshold**: Stored inline in memory
+- **Set threshold to 0**: Store all blobs inline
+
+```go
+// Store all blobs inline (no external files)
+config.BlobThreshold = 0
+
+// Store blobs larger than 100MB externally
+config.BlobThreshold = 100 * 1024 * 1024
 ```
 
 ## Backup and Restore

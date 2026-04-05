@@ -3,9 +3,11 @@ package types
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"strconv"
 	"strings"
 	"time"
@@ -142,9 +144,16 @@ func (dt DataType) Size() int {
 
 // Value represents a typed value in the database
 type Value struct {
-	Type   DataType
-	Data   interface{}
-	IsNull bool
+	Type    DataType
+	Data    interface{}
+	IsNull  bool
+	BlobRef *BlobRef // Optional: reference to external blob storage
+}
+
+// BlobRef represents a reference to an external blob
+type BlobRef struct {
+	ID   uint64 `json:"id"`
+	Size int64  `json:"size"`
 }
 
 // NewValue creates a new Value from any Go value
@@ -204,6 +213,86 @@ func NewBlobValue(data []byte) Value {
 // NewImageValue creates an image value
 func NewImageValue(data []byte) Value {
 	return Value{Type: TypeImage, Data: data}
+}
+
+// NewBlobValueFromReader creates a blob value from an io.Reader
+func NewBlobValueFromReader(r io.Reader) (Value, error) {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return Value{}, fmt.Errorf("failed to read blob data: %w", err)
+	}
+	return NewBlobValue(data), nil
+}
+
+// NewImageValueFromReader creates an image value from an io.Reader
+func NewImageValueFromReader(r io.Reader) (Value, error) {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return Value{}, fmt.Errorf("failed to read image data: %w", err)
+	}
+	return NewImageValue(data), nil
+}
+
+// NewBlobValueFromHex creates a blob value from a hex string
+func NewBlobValueFromHex(hexStr string) (Value, error) {
+	// Remove optional 0x prefix
+	hexStr = strings.TrimPrefix(hexStr, "0x")
+	hexStr = strings.TrimPrefix(hexStr, "0X")
+
+	// Remove whitespace
+	hexStr = strings.ReplaceAll(hexStr, " ", "")
+	hexStr = strings.ReplaceAll(hexStr, "\n", "")
+	hexStr = strings.ReplaceAll(hexStr, "\r", "")
+	hexStr = strings.ReplaceAll(hexStr, "\t", "")
+
+	if len(hexStr)%2 != 0 {
+		return Value{}, fmt.Errorf("invalid hex string: length must be even")
+	}
+
+	data, err := hex.DecodeString(hexStr)
+	if err != nil {
+		return Value{}, fmt.Errorf("invalid hex data: %w", err)
+	}
+
+	return NewBlobValue(data), nil
+}
+
+// NewImageValueFromHex creates an image value from a hex string
+func NewImageValueFromHex(hexStr string) (Value, error) {
+	// Remove optional 0x prefix
+	hexStr = strings.TrimPrefix(hexStr, "0x")
+	hexStr = strings.TrimPrefix(hexStr, "0X")
+
+	// Remove whitespace
+	hexStr = strings.ReplaceAll(hexStr, " ", "")
+	hexStr = strings.ReplaceAll(hexStr, "\n", "")
+	hexStr = strings.ReplaceAll(hexStr, "\r", "")
+	hexStr = strings.ReplaceAll(hexStr, "\t", "")
+
+	if len(hexStr)%2 != 0 {
+		return Value{}, fmt.Errorf("invalid hex string: length must be even")
+	}
+
+	data, err := hex.DecodeString(hexStr)
+	if err != nil {
+		return Value{}, fmt.Errorf("invalid hex data: %w", err)
+	}
+
+	return NewImageValue(data), nil
+}
+
+// ToHex converts a blob/image value to hex string
+func (v Value) ToHex() (string, error) {
+	if v.IsNull {
+		return "", nil
+	}
+
+	data, err := v.ToBytes()
+	if err != nil {
+		return "", err
+	}
+
+	return hex.EncodeToString(data), nil
 }
 
 // detectType detects the DataType from interface{}
@@ -446,6 +535,8 @@ func (v Value) ToBytes() ([]byte, error) {
 		return nil, nil
 	}
 
+	// If this is a blob reference, the actual data needs to be loaded from storage
+	// The storage layer should handle this before calling ToBytes
 	switch val := v.Data.(type) {
 	case []byte:
 		return val, nil
@@ -453,6 +544,44 @@ func (v Value) ToBytes() ([]byte, error) {
 		return []byte(val), nil
 	default:
 		return nil, fmt.Errorf("cannot convert %T to []byte", v.Data)
+	}
+}
+
+// IsBlobRef returns true if this value is a reference to external blob storage
+func (v Value) IsBlobRef() bool {
+	return v.BlobRef != nil
+}
+
+// BlobSize returns the size of the blob data
+// For blob references, returns the stored size; otherwise returns the actual data length
+func (v Value) BlobSize() int64 {
+	if v.IsNull {
+		return 0
+	}
+
+	if v.BlobRef != nil {
+		return v.BlobRef.Size
+	}
+
+	switch val := v.Data.(type) {
+	case []byte:
+		return int64(len(val))
+	case string:
+		return int64(len(val))
+	default:
+		return 0
+	}
+}
+
+// NewBlobRefValue creates a blob value with external storage reference
+func NewBlobRefValue(blobID uint64, size int64) Value {
+	return Value{
+		Type: TypeBlob,
+		Data: nil, // Data is stored externally
+		BlobRef: &BlobRef{
+			ID:   blobID,
+			Size: size,
+		},
 	}
 }
 
@@ -539,14 +668,27 @@ func (v Value) Clone() Value {
 		return NewNullValue()
 	}
 
+	copied := Value{Type: v.Type, Data: v.Data}
+
+	// Copy blob reference if present
+	if v.BlobRef != nil {
+		copied.BlobRef = &BlobRef{
+			ID:   v.BlobRef.ID,
+			Size: v.BlobRef.Size,
+		}
+	}
+
 	switch val := v.Data.(type) {
 	case []byte:
-		copied := make([]byte, len(val))
-		copy(copied, val)
-		return Value{Type: v.Type, Data: copied}
-	default:
-		return Value{Type: v.Type, Data: v.Data}
+		if v.BlobRef == nil {
+			// Only copy bytes if not using external storage
+			data := make([]byte, len(val))
+			copy(data, val)
+			copied.Data = data
+		}
 	}
+
+	return copied
 }
 
 // ColumnDef defines a column structure
@@ -693,9 +835,10 @@ func (r *Row) Clone() *Row {
 // Value marshaling/unmarshaling for JSON
 
 type valueJSON struct {
-	Type   string      `json:"type"`
-	Data   interface{} `json:"data"`
-	IsNull bool        `json:"is_null"`
+	Type    string      `json:"type"`
+	Data    interface{} `json:"data,omitempty"`
+	IsNull  bool        `json:"is_null"`
+	BlobRef *BlobRef    `json:"blob_ref,omitempty"`
 }
 
 // MarshalJSON implements json.Marshaler
@@ -706,17 +849,22 @@ func (v Value) MarshalJSON() ([]byte, error) {
 	}
 
 	if !v.IsNull {
-		switch v.Type {
-		case TypeDate, TypeTime, TypeDatetime:
-			if t, ok := v.Data.(time.Time); ok {
-				vj.Data = t.Format(time.RFC3339)
+		// If there's a blob reference, include it instead of the data
+		if v.BlobRef != nil {
+			vj.BlobRef = v.BlobRef
+		} else {
+			switch v.Type {
+			case TypeDate, TypeTime, TypeDatetime:
+				if t, ok := v.Data.(time.Time); ok {
+					vj.Data = t.Format(time.RFC3339)
+				}
+			case TypeBlob:
+				if data, ok := v.Data.([]byte); ok {
+					vj.Data = data
+				}
+			default:
+				vj.Data = v.Data
 			}
-		case TypeBlob:
-			if data, ok := v.Data.([]byte); ok {
-				vj.Data = data
-			}
-		default:
-			vj.Data = v.Data
 		}
 	}
 
@@ -732,8 +880,9 @@ func (v *Value) UnmarshalJSON(data []byte) error {
 
 	v.Type = ParseDataType(vj.Type)
 	v.IsNull = vj.IsNull
+	v.BlobRef = vj.BlobRef
 
-	if !vj.IsNull && vj.Data != nil {
+	if !vj.IsNull && vj.Data != nil && vj.BlobRef == nil {
 		switch v.Type {
 		case TypeInt, TypeSeq:
 			// JSON numbers are float64

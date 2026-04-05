@@ -13,6 +13,7 @@
 //   - Configurable logging
 //   - Standard Go SQL driver interface
 //   - Support for BLOB and FILE storage
+//   - SSH/SFTP remote database access
 //
 // Basic Usage:
 //
@@ -36,16 +37,6 @@
 //	}
 //	defer rows.Close()
 //
-//	for rows.Next() {
-//	    var id int64
-//	    var name string
-//	    var age int
-//	    if err := rows.Scan(&id, &name, &age); err != nil {
-//	        log.Fatal(err)
-//	    }
-//	    fmt.Printf("ID: %d, Name: %s, Age: %d\n", id, name, age)
-//	}
-//
 // Using with database/sql:
 //
 //	import (
@@ -54,10 +45,30 @@
 //	)
 //
 //	db, err := sql.Open("xxldb", "/path/to/database")
+//
+// SSH Remote Database:
+//
+//	// Using DSN
+//	db, err := sql.Open("xxldb", "ssh://user:password@host:22/path/to/db")
+//
+//	// Using OpenSSH function
+//	engine, err := xxldb.OpenSSH(xxldb.SSHConfig{
+//	    Host:     "server.com",
+//	    Port:     22,
+//	    Username: "admin",
+//	    Password: "secret",
+//	    DBPath:   "/data/mydb",
+//	})
 package xxldb
 
 import (
+	"database/sql"
+	"fmt"
+	"time"
+
+	_ "github.com/topxeq/xxldb/driver"
 	"github.com/topxeq/xxldb/executor"
+	"github.com/topxeq/xxldb/storage"
 	"github.com/topxeq/xxldb/types"
 )
 
@@ -95,6 +106,22 @@ const (
 	TypeFile     = types.TypeFile
 )
 
+// FileSystem is an interface for file system operations
+// Can be used to provide custom storage backends (e.g., SFTP, memory, etc.)
+type FileSystem = storage.FileSystem
+
+// SSHConfig holds SSH connection parameters for remote database access
+type SSHConfig struct {
+	Host       string        // SSH server hostname or IP
+	Port       int           // SSH server port (default: 22)
+	Username   string        // SSH username
+	Password   string        // SSH password (optional if using key)
+	PrivateKey string        // Path to SSH private key file (optional if using password)
+	Passphrase string        // Passphrase for encrypted private key (optional)
+	Timeout    time.Duration // Connection timeout (default: 30s)
+	DBPath     string        // Database path on remote server
+}
+
 // Open opens a database at the specified path
 func Open(path string) (*Engine, error) {
 	return executor.NewEngine(path, false)
@@ -113,6 +140,78 @@ func OpenWithConfig(config Config) (*Engine, error) {
 // NewEngine creates a new database engine (alias for Open)
 func NewEngine(path string, inMemory bool) (*Engine, error) {
 	return executor.NewEngine(path, inMemory)
+}
+
+// OpenSSH opens a remote database via SSH/SFTP
+//
+// Example:
+//
+//	engine, err := xxldb.OpenSSH(xxldb.SSHConfig{
+//	    Host:     "server.com",
+//	    Port:     22,
+//	    Username: "admin",
+//	    Password: "secret",
+//	    DBPath:   "/data/mydb",
+//	})
+func OpenSSH(config SSHConfig) (*Engine, error) {
+	if config.Port == 0 {
+		config.Port = 22
+	}
+	if config.Timeout == 0 {
+		config.Timeout = 30 * time.Second
+	}
+
+	sftpConfig := storage.SFTPConfig{
+		Host:       config.Host,
+		Port:       config.Port,
+		Username:   config.Username,
+		Password:   config.Password,
+		PrivateKey: config.PrivateKey,
+		Passphrase: config.Passphrase,
+		Timeout:    config.Timeout,
+		MaxRetries: 5,
+		RetryDelay: 2e9,
+	}
+
+	fs, err := storage.NewSFTPFS(config.DBPath, sftpConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create SSH connection: %w", err)
+	}
+
+	return executor.NewEngineWithFS(config.DBPath, false, fs)
+}
+
+// OpenWithFS opens a database with a custom filesystem
+// This allows using custom storage backends like SFTP, memory, etc.
+//
+// Example:
+//
+//	// Using local filesystem
+//	fs := storage.NewLocalFS("/path/to/db")
+//	engine, err := xxldb.OpenWithFS("/path/to/db", fs)
+//
+//	// Using SFTP filesystem
+//	sftpFS, _ := storage.NewSFTPFS("/remote/db", sftpConfig)
+//	engine, err := xxldb.OpenWithFS("/remote/db", sftpFS)
+func OpenWithFS(path string, fs FileSystem) (*Engine, error) {
+	return executor.NewEngineWithFS(path, false, fs)
+}
+
+// OpenDSN opens a database using a DSN string
+// Supported DSN formats:
+//   - :memory: - in-memory database
+//   - /path/to/db - local file database
+//   - ssh://user:pass@host:port/path/to/db - SSH with password
+//   - ssh://user@host:port/path/to/db?private_key=/path/to/key - SSH with key
+//
+// Note: This function uses database/sql internally. For direct Engine access,
+// use Open, OpenSSH, or OpenWithFS instead.
+//
+// Example:
+//
+//	db, err := xxldb.OpenDSN("ssh://admin:secret@server.com:22/data/mydb")
+func OpenDSN(dsn string) (*sql.DB, error) {
+	return sql.Open("xxldb", dsn)
 }
 
 // NewValue creates a new Value from any Go value

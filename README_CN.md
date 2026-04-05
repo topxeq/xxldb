@@ -13,6 +13,7 @@
 - **纯 Go 实现** - 无 CGO 依赖，跨平台支持 (Linux/macOS/Windows)
 - **完整的 SQL 支持** - SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER
 - **JOIN 和 UNION** - 支持 INNER/LEFT/RIGHT JOIN 和 UNION 操作
+- **全文检索** - 支持全文索引和 MATCH...AGAINST 搜索
 - **内置函数** - 字符串、数值、日期、聚合、图像函数
 - **脚本函数** - 支持 `xx_` 前缀的自定义脚本函数
 - **文件存储** - 支持 BLOB、FILE 和 IMAGE 类型存储文件/图片/文件夹
@@ -176,6 +177,83 @@ SELECT EXPORT_FOLDER(data, '/tmp/restored_project') FROM folders WHERE name = 'm
 - 文件夹结构以JSON格式存储在BLOB中
 - 文件大小限制可通过配置 `MaxFileSize` 设置（默认：无限制）
 
+## 全文检索
+
+XxLdb 提供基于倒排索引的全文检索功能，支持 TF-IDF 评分排序。
+
+### 创建全文索引
+
+```sql
+-- 创建包含文本内容的表
+CREATE TABLE articles (
+    id SEQ,
+    title VARCHAR(200),
+    content TEXT
+);
+
+-- 在 content 列创建全文索引
+CREATE FULLTEXT INDEX idx_content ON articles(content);
+
+-- 创建多个全文索引
+CREATE FULLTEXT INDEX idx_title ON articles(title);
+CREATE FULLTEXT INDEX idx_body ON articles(body);
+```
+
+### 全文检索查询
+
+使用 `MATCH...AGAINST` 语法进行全文检索：
+
+```sql
+-- 搜索包含"数据库"的文档
+SELECT * FROM articles WHERE MATCH(content) AGAINST('数据库');
+
+-- 多词搜索（AND 搜索 - 所有词都必须匹配）
+SELECT * FROM articles WHERE MATCH(content) AGAINST('数据库 编程');
+
+-- 按相关性排序
+SELECT id, title FROM articles 
+WHERE MATCH(content) AGAINST('全文检索') 
+ORDER BY id DESC;
+```
+
+### 工作原理
+
+- **倒排索引**：文本被分词后使用倒排索引结构进行索引
+- **TF-IDF 评分**：搜索结果使用简化的 TF-IDF 算法进行相关性评分
+- **AND 搜索**：多个搜索词采用 AND 逻辑组合
+- **Unicode 支持**：完整支持中文、日文等 Unicode 文本
+
+### 自动索引维护
+
+数据变更时全文索引自动更新：
+
+```sql
+-- 插入数据 - 自动索引
+INSERT INTO articles (title, content) VALUES ('简介', '这是关于数据库的文章');
+
+-- 更新数据 - 索引自动更新
+UPDATE articles SET content = '更新后的编程内容' WHERE id = 1;
+
+-- 删除数据 - 从索引中移除
+DELETE FROM articles WHERE id = 1;
+```
+
+### FTS API
+
+```go
+// 编程方式创建全文索引
+engine, _ := xxldb.Open("/path/to/db")
+engine.Execute("CREATE FULLTEXT INDEX idx_content ON mytable(content)")
+
+// 检查索引是否存在
+hasIndex := engine.FTS().HasIndex("mytable", "content")
+
+// 获取索引统计信息
+indexer := engine.FTS().GetIndex("mytable", "content")
+stats := indexer.Stats()
+fmt.Printf("文档数: %d, 词汇数: %d\n", stats.DocumentCount, stats.TermCount)
+```
+
 ## 命令行客户端
 
 ```bash
@@ -252,8 +330,10 @@ xxldb -db /path/to/db -user admin -password secret
 ### 图像函数
 - `LOAD_IMAGE(path)` - 从文件加载图像
 - `IMAGE_FROM_BASE64(str)` - 从BASE64字符串创建图像
+- `IMAGE_FROM_HEX(str)` - 从hex字符串创建图像（支持0x前缀）
 - `IMAGE_TO_BASE64(img)` - 转换为BASE64
 - `IMAGE_TO_BASE64(img, 'datauri')` - 转换为Data URI格式
+- `IMAGE_TO_HEX(img)` - 转换为hex字符串
 - `IMAGE_WIDTH(img)` - 获取图像宽度
 - `IMAGE_HEIGHT(img)` - 获取图像高度
 - `IMAGE_FORMAT(img)` - 获取图像格式 (png/jpeg/gif/...)
@@ -270,6 +350,9 @@ INSERT INTO photos (name, img) VALUES ('sunset', LOAD_IMAGE('/path/to/sunset.jpg
 -- 从BASE64加载
 INSERT INTO photos (name, img) VALUES ('avatar', IMAGE_FROM_BASE64('iVBORw0KGgo...'));
 
+-- 从hex字符串加载
+INSERT INTO photos (name, img) VALUES ('icon', IMAGE_FROM_HEX('89504e470d0a...'));
+
 -- 从Data URI加载
 INSERT INTO photos (name, img) VALUES ('logo', IMAGE_FROM_BASE64('data:image/png;base64,iVBORw0KGgo...'));
 
@@ -278,6 +361,117 @@ SELECT name, IMAGE_WIDTH(img), IMAGE_HEIGHT(img), IMAGE_FORMAT(img) FROM photos;
 
 -- 导出为Data URI（可直接嵌入HTML）
 SELECT name, IMAGE_TO_BASE64(img, 'datauri') FROM photos;
+
+-- 导出为hex字符串
+SELECT name, IMAGE_TO_HEX(img) FROM photos;
+```
+
+### BLOB函数
+- `BLOB_FROM_BASE64(str)` - 从BASE64字符串创建BLOB
+- `BLOB_FROM_HEX(str)` - 从hex字符串创建BLOB（支持0x前缀）
+- `BLOB_TO_BASE64(blob)` - 转换为BASE64字符串
+- `BLOB_TO_HEX(blob)` - 转换为hex字符串
+
+#### BLOB示例
+```sql
+CREATE TABLE files (id SEQ, name VARCHAR(100), data BLOB);
+
+-- 从BASE64插入
+INSERT INTO files (name, data) VALUES ('config', BLOB_FROM_BASE64('SGVsbG8gV29ybGQh'));
+
+-- 从hex插入
+INSERT INTO files (name, data) VALUES ('binary', BLOB_FROM_HEX('48656c6c6f'));
+
+-- 从带0x前缀的hex插入
+INSERT INTO files (name, data) VALUES ('binary2', BLOB_FROM_HEX('0x48656c6c6f'));
+
+-- 导出为BASE64
+SELECT name, BLOB_TO_BASE64(data) FROM files;
+
+-- 导出为hex
+SELECT name, BLOB_TO_HEX(data) FROM files;
+```
+
+### 嵌入式使用 BLOB/IMAGE API
+
+当将 XxLdb 作为嵌入式库使用时，可以直接在 Go 代码中操作 BLOB 和 IMAGE 数据：
+
+#### 使用驱动
+
+```go
+import (
+    "database/sql"
+    "io"
+    "strings"
+    
+    _ "github.com/topxeq/xxldb/driver"
+)
+
+// 从 []byte 插入 BLOB
+data := []byte("二进制数据")
+db.Exec("INSERT INTO files (name, data) VALUES (?, ?)", "test", driver.NewBlob(data))
+
+// 从 []byte 插入 IMAGE
+imgData := []byte{0x89, 0x50, 0x4e, 0x47, ...} // PNG 数据
+db.Exec("INSERT INTO photos (name, img) VALUES (?, ?)", "photo", driver.NewImage(imgData))
+
+// 从 io.Reader 插入
+reader := strings.NewReader("来自reader的数据")
+blob, _ := driver.BlobFromReader(reader)
+db.Exec("INSERT INTO files (name, data) VALUES (?, ?)", "from_reader", blob)
+
+// 从 io.Reader 插入 IMAGE
+imgReader := openImageFile() // 返回 io.Reader
+img, _ := driver.ImageFromReader(imgReader)
+db.Exec("INSERT INTO photos (name, img) VALUES (?, ?)", "photo", img)
+```
+
+#### 直接使用引擎
+
+```go
+import "github.com/topxeq/xxldb/executor"
+
+engine, _ := executor.NewEngine("/path/to/db", false)
+
+// 直接插入 BLOB（接受 []byte、io.Reader 或 hex 字符串）
+id, _ := engine.InsertBlobDirect("files", "data", []byte("二进制数据"))
+id, _ = engine.InsertBlobDirect("files", "data", "48656c6c6f") // hex 字符串
+id, _ = engine.InsertBlobDirect("files", "data", reader) // io.Reader
+
+// 直接插入 IMAGE
+id, _ := engine.InsertImageDirect("photos", "img", imageData)
+
+// 直接获取 BLOB/IMAGE
+data, _ := engine.GetBlobDirect("files", "data", "id = 1")
+imgData, _ := engine.GetImageDirect("photos", "img", "id = 1")
+
+// 直接更新 BLOB/IMAGE
+engine.UpdateBlobDirect("files", "data", newData, "id = 1")
+engine.UpdateImageDirect("photos", "img", newImgData, "id = 1")
+```
+
+#### 使用 types 包
+
+```go
+import "github.com/topxeq/xxldb/types"
+import "strings"
+
+// 从 []byte 创建 BLOB 值
+blobVal := types.NewBlobValue([]byte("数据"))
+
+// 从 []byte 创建 IMAGE 值
+imgVal := types.NewImageValue(imageBytes)
+
+// 从 io.Reader 创建
+blobVal, _ = types.NewBlobValueFromReader(reader)
+imgVal, _ = types.NewImageValueFromReader(reader)
+
+// 从 hex 字符串创建
+blobVal, _ = types.NewBlobValueFromHex("48656c6c6f")
+imgVal, _ = types.NewImageValueFromHex("89504e47...")
+
+// 转换为 hex 字符串
+hexStr, _ := blobVal.ToHex()
 ```
 
 ## 脚本函数
@@ -309,6 +503,8 @@ xxldb/
 │   └── ast.go         # AST 定义
 ├── executor/          # 查询执行器
 ├── function/          # 内置函数
+├── fts/               # 全文检索
+│   └── fts.go         # FTS 管理器和倒排索引
 ├── script/            # 脚本函数
 ├── auth/              # 认证模块
 ├── logger/            # 日志模块
@@ -320,15 +516,33 @@ xxldb/
 
 ```go
 config := xxldb.Config{
-    Path:         "/path/to/db",    // 数据库路径
-    InMemory:     false,            // 是否内存模式
-    LogLevel:     "INFO",           // 日志级别
-    Username:     "admin",          // 用户名
-    Password:     "secret",         // 密码
-    AutoCommit:   true,             // 自动提交
-    SyncInterval: 1000,             // 同步间隔(毫秒)
+    Path:          "/path/to/db",       // 数据库路径
+    InMemory:      false,               // 是否内存模式
+    LogLevel:      "INFO",              // 日志级别
+    Username:      "admin",             // 用户名
+    Password:      "secret",            // 密码
+    AutoCommit:    true,                // 自动提交
+    SyncInterval:  1000,                // 同步间隔(毫秒)
+    BlobThreshold: 1024 * 1024 * 1024,  // BLOB大小阈值（默认：1GB）
 }
 engine, err := xxldb.OpenWithConfig(config)
+```
+
+### BLOB存储阈值
+
+XxLdb 自动将大型 BLOB 存储到单独文件中，以减少内存占用：
+
+- **默认阈值**：1GB（1073741824字节）
+- **大于阈值的 BLOB**：存储在 `blobs/` 目录
+- **小于阈值的 BLOB**：内联存储在内存中
+- **设置阈值为 0**：所有 BLOB 都内联存储
+
+```go
+// 所有 BLOB 内联存储（无外部文件）
+config.BlobThreshold = 0
+
+// 大于 100MB 的 BLOB 存储到外部文件
+config.BlobThreshold = 100 * 1024 * 1024
 ```
 
 ## 备份恢复

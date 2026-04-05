@@ -386,6 +386,33 @@ func (s *Storage) recoverFromWAL() error {
 					if id, ok := dataMap["id"].(float64); ok {
 						info.ID = uint64(id)
 					}
+					// Restore columns
+					if cols, ok := dataMap["columns"].([]interface{}); ok {
+						for _, col := range cols {
+							if colMap, ok := col.(map[string]interface{}); ok {
+								colDef := types.ColumnDef{}
+								if n, ok := colMap["name"].(string); ok {
+									colDef.Name = n
+								}
+								if t, ok := colMap["type"].(string); ok {
+									colDef.Type = types.ParseDataType(t)
+								}
+								if l, ok := colMap["length"].(float64); ok {
+									colDef.Length = int(l)
+								}
+								if nl, ok := colMap["nullable"].(bool); ok {
+									colDef.Nullable = nl
+								}
+								if pk, ok := colMap["primary_key"].(bool); ok {
+									colDef.PrimaryKey = pk
+								}
+								if ai, ok := colMap["auto_inc"].(bool); ok {
+									colDef.AutoInc = ai
+								}
+								info.Columns = append(info.Columns, colDef)
+							}
+						}
+					}
 					s.tables[info.Name] = info
 					if s.rowData == nil {
 						s.rowData = make(map[string][][]types.Value)

@@ -1874,15 +1874,11 @@ t.Error("Table recover_test not found after recovery")
 
 // TestInitFileStorageError tests initFileStorage error paths
 func TestInitFileStorageError(t *testing.T) {
-// Test with invalid path
-storage := &Storage{
-path:    "/nonexistent/path/that/does/not/exist",
-enabled: true,
-}
-err := storage.initFileStorage()
-if err == nil {
-t.Error("Expected error for invalid path")
-}
+	// Test with invalid path - this should fail during NewStorage
+	_, err := NewStorage("/nonexistent/path/that/does/not/exist", false)
+	if err == nil {
+		t.Error("Expected error for invalid path")
+	}
 }
 
 // TestRecoverFromWALWithCheckpoint tests recovery with checkpoint
@@ -3749,20 +3745,23 @@ func TestStorageLoadMetadataInvalidJSON(t *testing.T) {
 	defer os.RemoveAll(dir)
 
 	// Create metadata file with invalid JSON
-	metaPath := filepath.Join(dir, "metadata.json")
+	metaPath := filepath.Join(dir, MetaFileName)
 	invalidJSON := []byte(`{invalid json}`)
 	if err := os.WriteFile(metaPath, invalidJSON, 0644); err != nil {
 		t.Fatal(err)
 	}
 
-	// Try to load - should fail
+	// Create storage with filesystem
+	fs := NewLocalFS(dir)
 	storage := &Storage{
 		path:      dir,
+		enabled:   true,
+		fs:        fs,
 		tables:    make(map[string]*TableInfo),
 		sequences: make(map[string]int64),
 		rowData:   make(map[string][][]types.Value),
 		rowIDs:    make(map[string][]uint64),
-		dataFiles: make(map[string]*os.File),
+		dataFiles: make(map[string]File),
 	}
 
 	err = storage.loadMetadata()
@@ -4731,4 +4730,226 @@ func BenchmarkStorageDeleteRows(b *testing.B) {
 		// Drop table
 		storage.DropTable("bench_delete")
 	}
+}
+
+// TestBlobThreshold tests automatic external blob storage for large blobs
+func TestBlobThreshold(t *testing.T) {
+	dir, err := os.MkdirTemp("", "xxldb-blob-threshold-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	storage, err := NewStorage(dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+
+	// Set a small threshold for testing (100 bytes)
+	cfg := storage.GetConfig()
+	cfg.BlobThreshold = 100
+	storage.SetConfig(cfg)
+
+	// Create table with blob column
+	tableInfo := types.NewTableInfo(1, "blob_test", []types.ColumnDef{
+		{Name: "id", Type: types.TypeInt},
+		{Name: "data", Type: types.TypeBlob},
+	})
+	if err := storage.CreateTable(tableInfo); err != nil {
+		t.Fatal(err)
+	}
+
+	// Insert small blob (should stay inline)
+	smallData := []byte("small blob data")
+	smallRow := []types.Value{
+		types.NewIntValue(1),
+		types.NewBlobValue(smallData),
+	}
+	_, _, err = storage.InsertRow("blob_test", smallRow)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Insert large blob (should be stored externally)
+	largeData := make([]byte, 200)
+	for i := range largeData {
+		largeData[i] = byte(i % 256)
+	}
+	largeRow := []types.Value{
+		types.NewIntValue(2),
+		types.NewBlobValue(largeData),
+	}
+	_, _, err = storage.InsertRow("blob_test", largeRow)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Retrieve rows and verify data
+	rows, err := storage.GetRows("blob_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(rows) != 2 {
+		t.Fatalf("Expected 2 rows, got %d", len(rows))
+	}
+
+	// Verify small blob
+	smallRead := rows[0][1]
+	if smallRead.IsNull {
+		t.Fatal("Small blob should not be null")
+	}
+	smallBytes, err := smallRead.ToBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(smallBytes) != string(smallData) {
+		t.Errorf("Small blob mismatch: got %s, want %s", string(smallBytes), string(smallData))
+	}
+
+	// Verify large blob
+	largeRead := rows[1][1]
+	if largeRead.IsNull {
+		t.Fatal("Large blob should not be null")
+	}
+	largeBytes, err := largeRead.ToBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(largeBytes) != len(largeData) {
+		t.Errorf("Large blob size mismatch: got %d, want %d", len(largeBytes), len(largeData))
+	}
+	for i := range largeData {
+		if largeBytes[i] != largeData[i] {
+			t.Errorf("Large blob content mismatch at index %d", i)
+			break
+		}
+	}
+
+	t.Logf("Blob threshold test passed: small blob inline, large blob external")
+}
+
+// TestBlobThresholdZero tests that threshold=0 keeps all blobs inline
+func TestBlobThresholdZero(t *testing.T) {
+	dir, err := os.MkdirTemp("", "xxldb-blob-threshold-zero-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	storage, err := NewStorage(dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+
+	// Set threshold to 0 (all blobs inline)
+	cfg := storage.GetConfig()
+	cfg.BlobThreshold = 0
+	storage.SetConfig(cfg)
+
+	// Create table with blob column
+	tableInfo := types.NewTableInfo(1, "inline_blob_test", []types.ColumnDef{
+		{Name: "id", Type: types.TypeInt},
+		{Name: "data", Type: types.TypeBlob},
+	})
+	if err := storage.CreateTable(tableInfo); err != nil {
+		t.Fatal(err)
+	}
+
+	// Insert large blob
+	largeData := make([]byte, 10000)
+	largeRow := []types.Value{
+		types.NewIntValue(1),
+		types.NewBlobValue(largeData),
+	}
+	_, _, err = storage.InsertRow("inline_blob_test", largeRow)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Retrieve and verify
+	rows, err := storage.GetRows("inline_blob_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(rows) != 1 {
+		t.Fatalf("Expected 1 row, got %d", len(rows))
+	}
+
+	// With threshold=0, blob should not be stored externally
+	blobVal := rows[0][1]
+	if blobVal.IsBlobRef() {
+		t.Error("With threshold=0, blob should be stored inline, not externally")
+	}
+
+	t.Logf("Threshold=0 test passed: all blobs stored inline")
+}
+
+// TestBlobRefRecovery tests blob reference recovery from WAL
+func TestBlobRefRecovery(t *testing.T) {
+	dir, err := os.MkdirTemp("", "xxldb-blob-ref-recovery-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	// Create storage with small threshold
+	storage, err := NewStorage(dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := storage.GetConfig()
+	cfg.BlobThreshold = 100
+	storage.SetConfig(cfg)
+
+	// Create table and insert large blob
+	tableInfo := types.NewTableInfo(1, "recovery_test", []types.ColumnDef{
+		{Name: "id", Type: types.TypeInt},
+		{Name: "data", Type: types.TypeBlob},
+	})
+	storage.CreateTable(tableInfo)
+
+	largeData := make([]byte, 200)
+	for i := range largeData {
+		largeData[i] = byte(i % 256)
+	}
+	storage.InsertRow("recovery_test", []types.Value{
+		types.NewIntValue(1),
+		types.NewBlobValue(largeData),
+	})
+
+	// Close storage
+	storage.Close()
+
+	// Reopen storage
+	storage2, err := NewStorage(dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage2.Close()
+
+	// Retrieve data
+	rows, err := storage2.GetRows("recovery_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(rows) != 1 {
+		t.Fatalf("Expected 1 row, got %d", len(rows))
+	}
+
+	// Verify blob data
+	blobBytes, err := rows[0][1].ToBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(blobBytes) != len(largeData) {
+		t.Errorf("Blob size mismatch after recovery: got %d, want %d", len(blobBytes), len(largeData))
+	}
+
+	t.Logf("Blob reference recovery test passed")
 }

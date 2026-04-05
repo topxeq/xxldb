@@ -3,6 +3,7 @@ package function
 
 import (
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"image"
@@ -160,6 +161,14 @@ func init() {
 	Register("IMAGE_FORMAT", fnImageFormat)
 	Register("IMAGE_SIZE", fnImageSize)
 	Register("IMAGE_MIME", fnImageMime)
+	Register("IMAGE_FROM_HEX", fnImageFromHex)
+	Register("IMAGE_TO_HEX", fnImageToHex)
+
+	// BLOB functions
+	Register("BLOB_FROM_BASE64", fnBlobFromBase64)
+	Register("BLOB_TO_BASE64", fnBlobToBase64)
+	Register("BLOB_FROM_HEX", fnBlobFromHex)
+	Register("BLOB_TO_HEX", fnBlobToHex)
 }
 
 // Register registers a function
@@ -1884,6 +1893,166 @@ func fnImageMime(args []types.Value) (types.Value, error) {
 	}
 
 	return types.NewStringValue(info.Mime), nil
+}
+
+// fnImageFromHex creates an IMAGE from a hex string
+func fnImageFromHex(args []types.Value) (types.Value, error) {
+	if len(args) < 1 {
+		return types.Value{}, fmt.Errorf("IMAGE_FROM_HEX requires 1 argument")
+	}
+	if args[0].IsNull {
+		return types.NewNullValue(), nil
+	}
+
+	input := args[0].ToString()
+
+	// Remove optional 0x prefix
+	input = strings.TrimPrefix(input, "0x")
+	input = strings.TrimPrefix(input, "0X")
+
+	// Remove any whitespace
+	input = strings.ReplaceAll(input, " ", "")
+	input = strings.ReplaceAll(input, "\n", "")
+	input = strings.ReplaceAll(input, "\r", "")
+	input = strings.ReplaceAll(input, "\t", "")
+
+	// Validate hex string length (must be even)
+	if len(input)%2 != 0 {
+		return types.Value{}, fmt.Errorf("invalid hex string: length must be even")
+	}
+
+	// Decode hex
+	data, err := hex.DecodeString(input)
+	if err != nil {
+		return types.Value{}, fmt.Errorf("invalid hex data: %v", err)
+	}
+
+	return types.NewImageValue(data), nil
+}
+
+// fnImageToHex converts an IMAGE to a hex string
+func fnImageToHex(args []types.Value) (types.Value, error) {
+	if len(args) < 1 {
+		return types.Value{}, fmt.Errorf("IMAGE_TO_HEX requires 1 argument")
+	}
+
+	data, err := getImageData(args[0])
+	if err != nil {
+		return types.NewNullValue(), nil
+	}
+
+	// Encode to hex (lowercase)
+	encoded := hex.EncodeToString(data)
+
+	return types.NewStringValue(encoded), nil
+}
+
+// fnBlobFromBase64 creates a BLOB from a base64 string
+func fnBlobFromBase64(args []types.Value) (types.Value, error) {
+	if len(args) < 1 {
+		return types.Value{}, fmt.Errorf("BLOB_FROM_BASE64 requires 1 argument")
+	}
+	if args[0].IsNull {
+		return types.NewNullValue(), nil
+	}
+
+	input := args[0].ToString()
+
+	// Decode base64
+	data, err := base64.StdEncoding.DecodeString(input)
+	if err != nil {
+		// Try URL encoding
+		data, err = base64.URLEncoding.DecodeString(input)
+		if err != nil {
+			return types.Value{}, fmt.Errorf("invalid base64 data: %v", err)
+		}
+	}
+
+	return types.NewBlobValue(data), nil
+}
+
+// fnBlobToBase64 converts a BLOB to a base64 string
+func fnBlobToBase64(args []types.Value) (types.Value, error) {
+	if len(args) < 1 {
+		return types.Value{}, fmt.Errorf("BLOB_TO_BASE64 requires 1 argument")
+	}
+
+	if args[0].IsNull {
+		return types.NewNullValue(), nil
+	}
+
+	var data []byte
+	switch v := args[0].Data.(type) {
+	case []byte:
+		data = v
+	case string:
+		data = []byte(v)
+	default:
+		return types.Value{}, fmt.Errorf("BLOB_TO_BASE64 requires a BLOB argument")
+	}
+
+	encoded := base64.StdEncoding.EncodeToString(data)
+	return types.NewStringValue(encoded), nil
+}
+
+// fnBlobFromHex creates a BLOB from a hex string
+func fnBlobFromHex(args []types.Value) (types.Value, error) {
+	if len(args) < 1 {
+		return types.Value{}, fmt.Errorf("BLOB_FROM_HEX requires 1 argument")
+	}
+	if args[0].IsNull {
+		return types.NewNullValue(), nil
+	}
+
+	input := args[0].ToString()
+
+	// Remove optional 0x prefix
+	input = strings.TrimPrefix(input, "0x")
+	input = strings.TrimPrefix(input, "0X")
+
+	// Remove any whitespace
+	input = strings.ReplaceAll(input, " ", "")
+	input = strings.ReplaceAll(input, "\n", "")
+	input = strings.ReplaceAll(input, "\r", "")
+	input = strings.ReplaceAll(input, "\t", "")
+
+	// Validate hex string length (must be even)
+	if len(input)%2 != 0 {
+		return types.Value{}, fmt.Errorf("invalid hex string: length must be even")
+	}
+
+	// Decode hex
+	data, err := hex.DecodeString(input)
+	if err != nil {
+		return types.Value{}, fmt.Errorf("invalid hex data: %v", err)
+	}
+
+	return types.NewBlobValue(data), nil
+}
+
+// fnBlobToHex converts a BLOB to a hex string
+func fnBlobToHex(args []types.Value) (types.Value, error) {
+	if len(args) < 1 {
+		return types.Value{}, fmt.Errorf("BLOB_TO_HEX requires 1 argument")
+	}
+
+	if args[0].IsNull {
+		return types.NewNullValue(), nil
+	}
+
+	var data []byte
+	switch v := args[0].Data.(type) {
+	case []byte:
+		data = v
+	case string:
+		data = []byte(v)
+	default:
+		return types.Value{}, fmt.Errorf("BLOB_TO_HEX requires a BLOB argument")
+	}
+
+	// Encode to hex (lowercase)
+	encoded := hex.EncodeToString(data)
+	return types.NewStringValue(encoded), nil
 }
 
 // Unused imports workaround - these are needed for image decoding

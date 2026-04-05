@@ -3,6 +3,7 @@ package importpkg
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/topxeq/xxldb/types"
@@ -25,7 +26,10 @@ func NewMySQLImporter() *MySQLImporter {
 // Connect connects to the MySQL database
 func (m *MySQLImporter) Connect(dsn string) error {
 	// MySQL DSN format: user:password@tcp(host:port)/dbname
-	db, err := sql.Open("mysql", dsn)
+	// Also accept: user:password@host:port/dbname (will be converted)
+	mysqlDSN := m.convertDSN(dsn)
+
+	db, err := sql.Open("mysql", mysqlDSN)
 	if err != nil {
 		return fmt.Errorf("failed to open MySQL connection: %w", err)
 	}
@@ -36,8 +40,40 @@ func (m *MySQLImporter) Connect(dsn string) error {
 	}
 
 	m.db = db
-	m.dsn = dsn
+	m.dsn = mysqlDSN
 	return nil
+}
+
+// convertDSN converts various DSN formats to MySQL driver format
+// Accepts: user:pass@host:port/dbname -> user:pass@tcp(host:port)/dbname
+// Or already valid: user:pass@tcp(host:port)/dbname
+func (m *MySQLImporter) convertDSN(dsn string) string {
+	// If already has tcp(), return as is
+	if strings.Contains(dsn, "@tcp(") {
+		return dsn
+	}
+
+	// Parse user:pass@host:port/dbname format
+	// Split at @ to get user:pass and host:port/dbname
+	atIndex := strings.Index(dsn, "@")
+	if atIndex == -1 {
+		return dsn // No @ found, return as is
+	}
+
+	userPass := dsn[:atIndex+1] // user:pass@
+	rest := dsn[atIndex+1:]     // host:port/dbname
+
+	// Find the first / to separate host:port from dbname
+	slashIndex := strings.Index(rest, "/")
+	if slashIndex == -1 {
+		return dsn // No / found, return as is
+	}
+
+	hostPort := rest[:slashIndex]
+	dbname := rest[slashIndex:] // /dbname
+
+	// Reconstruct with tcp()
+	return userPass + "tcp(" + hostPort + ")" + dbname
 }
 
 // Disconnect closes the connection
@@ -144,6 +180,9 @@ func (m *MySQLImporter) getColumns(dbName, tableName string, schema *TableSchema
 	}
 	defer rows.Close()
 
+	// Use a map to track processed columns to avoid duplicates
+	processedCols := make(map[string]bool)
+
 	for rows.Next() {
 		var name, colType, isNullable, columnKey, extra string
 		var defaultValue sql.NullString
@@ -151,6 +190,12 @@ func (m *MySQLImporter) getColumns(dbName, tableName string, schema *TableSchema
 		if err := rows.Scan(&name, &colType, &isNullable, &columnKey, &defaultValue, &extra); err != nil {
 			return err
 		}
+
+		// Skip if already processed
+		if processedCols[name] {
+			continue
+		}
+		processedCols[name] = true
 
 		targetType, length := m.converter.ConvertMySQLType(colType)
 
@@ -194,12 +239,17 @@ func (m *MySQLImporter) getPrimaryKeys(dbName, tableName string, schema *TableSc
 	}
 	defer rows.Close()
 
+	processedCols := make(map[string]bool)
+
 	for rows.Next() {
 		var columnName, constraintName string
 		if err := rows.Scan(&columnName, &constraintName); err != nil {
 			return err
 		}
-		schema.PrimaryKeys = append(schema.PrimaryKeys, columnName)
+		if !processedCols[columnName] {
+			schema.PrimaryKeys = append(schema.PrimaryKeys, columnName)
+			processedCols[columnName] = true
+		}
 	}
 
 	return nil
@@ -209,12 +259,12 @@ func (m *MySQLImporter) getPrimaryKeys(dbName, tableName string, schema *TableSc
 func (m *MySQLImporter) getForeignKeys(dbName, tableName string, schema *TableSchema) error {
 	query := `
 		SELECT
-			CONSTRAINT_NAME,
-			COLUMN_NAME,
-			REFERENCED_TABLE_NAME,
-			REFERENCED_COLUMN_NAME,
-			DELETE_RULE,
-			UPDATE_RULE
+			KCU.CONSTRAINT_NAME,
+			KCU.COLUMN_NAME,
+			KCU.REFERENCED_TABLE_NAME,
+			KCU.REFERENCED_COLUMN_NAME,
+			RC.DELETE_RULE,
+			RC.UPDATE_RULE
 		FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE KCU
 		JOIN INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS RC
 			ON KCU.CONSTRAINT_NAME = RC.CONSTRAINT_NAME
@@ -267,7 +317,7 @@ func (m *MySQLImporter) getForeignKeys(dbName, tableName string, schema *TableSc
 func (m *MySQLImporter) getUniqueKeys(dbName, tableName string, schema *TableSchema) error {
 	query := `
 		SELECT
-			KCU.CONSTRAINT_NAME,
+			TC.CONSTRAINT_NAME,
 			KCU.COLUMN_NAME
 		FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS TC
 		JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE KCU
@@ -290,11 +340,24 @@ func (m *MySQLImporter) getUniqueKeys(dbName, tableName string, schema *TableSch
 	defer rows.Close()
 
 	ukMap := make(map[string]*UniqueKeyInfo)
+	colProcessed := make(map[string]map[string]bool) // constraint -> column -> processed
+
 	for rows.Next() {
 		var constraintName, columnName string
 		if err := rows.Scan(&constraintName, &columnName); err != nil {
 			return err
 		}
+
+		// Initialize processed tracking for this constraint
+		if colProcessed[constraintName] == nil {
+			colProcessed[constraintName] = make(map[string]bool)
+		}
+
+		// Skip duplicates
+		if colProcessed[constraintName][columnName] {
+			continue
+		}
+		colProcessed[constraintName][columnName] = true
 
 		if uk, exists := ukMap[constraintName]; exists {
 			uk.Columns = append(uk.Columns, columnName)

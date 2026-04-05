@@ -104,19 +104,29 @@ var keywords = map[string]bool{
 	// Constraints
 	"PRIMARY": true, "KEY": true, "FOREIGN": true, "REFERENCES": true,
 	"UNIQUE": true, "NULL": true, "DEFAULT": true, "CHECK": true,
+	"CONSTRAINT": true,
 	"AUTO_INCREMENT": true, "AUTOINCREMENT": true,
 	// Misc
 	"AS": true, "IN": true, "BETWEEN": true, "LIKE": true, "IS": true,
 	"EXISTS": true, "CASE": true, "WHEN": true, "THEN": true, "ELSE": true, "END": true,
 	"IF": true, "NULLIF": true, "COALESCE": true,
 	"TRUE": true, "FALSE": true,
-	"SHOW": true, "TABLES": true, "DATABASES": true, "COLUMNS": true,
+	"SHOW": true, "TABLES": true, "DATABASES": true, "COLUMNS": true, "DESCRIBE": true,
+	"FULL": true, "VARIABLES": true, "STATUS": true, "WARNINGS": true,
+	"GRANTS": true, "PROCESSLIST": true, "INDEXES": true,
+	"GLOBAL": true, "SESSION": true,
+	"FUNCTION": true, "PROCEDURE": true, "TRIGGERS": true, "TRIGGER": true,
+	"COLLATION": true, "OPEN": true, "EVENTS": true, "EVENT": true,
+	"ENGINES": true, "ENGINE": true,
+	"KEYS": true,
 	"USE": true, "DATABASE": true, "SCHEMA": true,
 	"LOAD": true, "OUTFILE": true, "FOLDER": true,
 	"BACKUP": true, "RESTORE": true,
 	"USER": true, "PASSWORD": true,
 	"LOG": true, "LEVEL": true,
-	"BEGIN": true, "COMMIT": true, "ROLLBACK": true, "TRANSACTION": true,
+	"BEGIN": true, "COMMIT": true, "ROLLBACK": true, "TRANSACTION": true, "START": true,
+	// Full-text search
+	"FULLTEXT": true, "MATCH": true, "AGAINST": true,
 }
 
 // Lexer tokenizes SQL input
@@ -153,6 +163,8 @@ func (l *Lexer) NextToken() Token {
 		return l.scanNumber()
 	case r == '\'' || r == '"':
 		return l.scanString()
+	case r == '`':
+		return l.scanBacktickIdent()
 	case r == '?':
 		l.next()
 		return Token{Type: TokParameter, Value: "?", Pos: l.start}
@@ -180,9 +192,35 @@ func (l *Lexer) NextToken() Token {
 		l.next()
 		return Token{Type: TokDot, Value: ".", Pos: l.start}
 	case r == '*':
+		// Check for end of MySQL conditional comment */
+		if l.peekAt(1) == '/' {
+			l.next() // Skip *
+			l.next() // Skip /
+			return l.NextToken() // Continue with next token
+		}
 		l.next()
 		return Token{Type: TokStar, Value: "*", Pos: l.start}
-	case r == '=' || r == '<' || r == '>' || r == '!' || r == '|' || r == '+' || r == '*' || r == '/' || r == '%':
+	case r == '@':
+		return l.scanSystemVariable()
+	case r == '/':
+		// Check for comment
+		if l.peekAt(1) == '*' {
+			// Check for MySQL conditional comment /*! or /*!12345
+			if l.peekAt(2) == '!' {
+				// This is a MySQL conditional comment, skip the /*! but keep the content
+				l.next() // Skip /
+				l.next() // Skip *
+				l.next() // Skip !
+				// Skip optional version number (e.g., /*!12345)
+				for isDigit(l.peek()) {
+					l.next()
+				}
+				// Continue parsing the content as regular SQL
+				return l.NextToken()
+			}
+			l.skipBlockComment()
+			return l.NextToken()
+		}
 		return l.scanOperator()
 	case r == '-':
 		// Check for comment
@@ -191,17 +229,30 @@ func (l *Lexer) NextToken() Token {
 			return l.NextToken()
 		}
 		return l.scanOperator()
-	case r == '/':
-		// Check for comment
-		if l.peekAt(1) == '*' {
-			l.skipBlockComment()
-			return l.NextToken()
-		}
+	case r == '=' || r == '<' || r == '>' || r == '!' || r == '|' || r == '+' || r == '%':
 		return l.scanOperator()
 	default:
 		l.next()
 		return Token{Type: TokError, Value: fmt.Sprintf("unexpected character: %c", r), Pos: l.start}
 	}
+}
+
+// scanBacktickIdent scans a backtick-quoted identifier (MySQL style)
+func (l *Lexer) scanBacktickIdent() Token {
+	l.next() // consume opening `
+	var sb strings.Builder
+	for {
+		r := l.peek()
+		if r == 0 {
+			return Token{Type: TokError, Value: "unterminated backtick identifier", Pos: l.start}
+		}
+		if r == '`' {
+			l.next() // consume closing `
+			break
+		}
+		sb.WriteRune(l.next())
+	}
+	return Token{Type: TokIdent, Value: sb.String(), Pos: l.start}
 }
 
 // scanIdentOrKeyword scans an identifier or keyword
@@ -391,6 +442,28 @@ func (l *Lexer) skipWhitespace() {
 		}
 		l.next()
 	}
+}
+
+// scanSystemVariable scans a system variable (@@xxx)
+func (l *Lexer) scanSystemVariable() Token {
+	l.next() // Skip first @
+
+	// Check for @@
+	if l.peek() == '@' {
+		l.next() // Skip second @
+	}
+
+	// Scan the variable name (can include letters, digits, underscore, and dot)
+	for {
+		r := l.peek()
+		if !isLetter(r) && !isDigit(r) && r != '_' && r != '.' {
+			break
+		}
+		l.next()
+	}
+
+	value := l.input[l.start:l.pos]
+	return Token{Type: TokIdent, Value: value, Pos: l.start}
 }
 
 // skipLineComment skips a line comment (-- ...)

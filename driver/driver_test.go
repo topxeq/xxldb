@@ -1,9 +1,11 @@
 package driver
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -1814,4 +1816,152 @@ func TestDriverStringWithSpecialChars(t *testing.T) {
 	if err != nil {
 		t.Logf("Insert with semicolon: %v", err)
 	}
+}
+
+// TestDriverBlobValue tests BlobValue wrapper for BLOB columns
+func TestDriverBlobValue(t *testing.T) {
+	db, err := sql.Open("xxldb", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// Create table with BLOB column
+	_, err = db.Exec("CREATE TABLE blobs (id SEQ, data BLOB)")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Test with BlobValue wrapper
+	testData := []byte("hello world, this is blob data")
+	_, err = db.Exec("INSERT INTO blobs (data) VALUES (?)", NewBlob(testData))
+	if err != nil {
+		t.Fatalf("Failed to insert with BlobValue: %v", err)
+	}
+
+	// Verify data was inserted
+	rows, err := db.Query("SELECT data FROM blobs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+
+	if rows.Next() {
+		var data []byte
+		if err := rows.Scan(&data); err != nil {
+			t.Fatalf("Failed to scan blob: %v", err)
+		}
+		if string(data) != string(testData) {
+			t.Errorf("Expected %q, got %q", testData, data)
+		}
+		t.Logf("BlobValue inserted and retrieved: %q", string(data))
+	} else {
+		t.Error("Expected a row")
+	}
+}
+
+// TestDriverImageValue tests ImageValue wrapper for IMAGE columns
+func TestDriverImageValue(t *testing.T) {
+	db, err := sql.Open("xxldb", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// Create table with IMAGE column
+	_, err = db.Exec("CREATE TABLE images (id SEQ, img IMAGE)")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a minimal valid PNG (1x1 pixel)
+	minimalPNG := []byte{
+		0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, // PNG signature
+		0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, // IHDR length + type
+		0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, // 1x1
+		0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xde, // bit depth, color type, etc
+		0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, // IDAT
+		0x08, 0xd7, 0x63, 0xf8, 0xff, 0xff, 0x3f, 0x00,
+		0x05, 0xfe, 0x02, 0xfe, 0xdc, 0xcc, 0x59, 0xe7,
+		0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, // IEND
+		0xae, 0x42, 0x60, 0x82,
+	}
+
+	// Test with ImageValue wrapper
+	_, err = db.Exec("INSERT INTO images (img) VALUES (?)", NewImage(minimalPNG))
+	if err != nil {
+		t.Fatalf("Failed to insert with ImageValue: %v", err)
+	}
+
+	// Verify data was inserted
+	rows, err := db.Query("SELECT img FROM images")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+
+	if rows.Next() {
+		var data []byte
+		if err := rows.Scan(&data); err != nil {
+			t.Fatalf("Failed to scan image: %v", err)
+		}
+		t.Logf("ImageValue inserted and retrieved, size: %d bytes", len(data))
+	} else {
+		t.Error("Expected a row")
+	}
+}
+
+// TestDriverRawBytes tests raw []byte for BLOB (backwards compatibility)
+func TestDriverRawBytes(t *testing.T) {
+	db, err := sql.Open("xxldb", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// Create table with BLOB column
+	_, err = db.Exec("CREATE TABLE raw_blobs (id SEQ, data BLOB)")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Test with raw []byte (should be treated as BLOB)
+	testData := []byte{0x01, 0x02, 0x03, 0x04, 0x05}
+	_, err = db.Exec("INSERT INTO raw_blobs (data) VALUES (?)", testData)
+	if err != nil {
+		t.Fatalf("Failed to insert with raw []byte: %v", err)
+	}
+
+	t.Log("Raw []byte inserted successfully as BLOB")
+}
+
+// TestDriverBlobFromReader tests BlobFromReader function
+func TestDriverBlobFromReader(t *testing.T) {
+	reader := strings.NewReader("test data from reader")
+
+	blob, err := BlobFromReader(reader)
+	if err != nil {
+		t.Fatalf("BlobFromReader failed: %v", err)
+	}
+
+	if string(blob.Data) != "test data from reader" {
+		t.Errorf("Expected 'test data from reader', got %q", string(blob.Data))
+	}
+	t.Log("BlobFromReader works correctly")
+}
+
+// TestDriverImageFromReader tests ImageFromReader function
+func TestDriverImageFromReader(t *testing.T) {
+	testData := []byte("fake image data")
+	reader := bytes.NewReader(testData)
+
+	img, err := ImageFromReader(reader)
+	if err != nil {
+		t.Fatalf("ImageFromReader failed: %v", err)
+	}
+
+	if string(img.Data) != "fake image data" {
+		t.Errorf("Expected 'fake image data', got %q", string(img.Data))
+	}
+	t.Log("ImageFromReader works correctly")
 }

@@ -347,7 +347,7 @@ func (m *ImportManager) buildColumnDef(col ColumnInfo, schema *TableSchema) stri
 	}
 
 	if col.DefaultValue != nil {
-		parts = append(parts, fmt.Sprintf("DEFAULT %v", col.DefaultValue))
+		parts = append(parts, handleDefaultValue(col.DefaultValue))
 	}
 
 	return strings.Join(parts, " ")
@@ -373,16 +373,30 @@ func (m *ImportManager) insertRows(tableName string, schema *TableSchema, rows [
 		return nil
 	}
 
-	// Insert each row directly for better performance
+	// Insert each row using SQL statements
 	for _, row := range rows {
-		// Convert values
-		values := make([]interface{}, len(row))
+		// Build VALUES clause
+		var valueStrs []string
 		for i, val := range row {
-			values[i] = m.convertValue(val, schema.Columns[i].TargetType)
+			converted := m.convertValue(val, schema.Columns[i].TargetType)
+			if converted == nil {
+				valueStrs = append(valueStrs, "NULL")
+			} else {
+				switch v := converted.(type) {
+				case int, int32, int64, float32, float64:
+					valueStrs = append(valueStrs, fmt.Sprintf("%v", v))
+				case string:
+					escaped := strings.ReplaceAll(v, "'", "''")
+					valueStrs = append(valueStrs, fmt.Sprintf("'%s'", escaped))
+				default:
+					escaped := strings.ReplaceAll(fmt.Sprintf("%v", v), "'", "''")
+					valueStrs = append(valueStrs, fmt.Sprintf("'%s'", escaped))
+				}
+			}
 		}
 
-		// Use direct insert for better performance
-		if _, err := m.engine.InsertRowDirect(tableName, values); err != nil {
+		insertSQL := fmt.Sprintf("INSERT INTO %s VALUES (%s)", tableName, strings.Join(valueStrs, ", "))
+		if _, err := m.engine.Execute(insertSQL); err != nil {
 			return err
 		}
 	}
@@ -452,4 +466,20 @@ func ParseDSN(dsn string) (DatabaseType, string, error) {
 	default:
 		return "", "", fmt.Errorf("unsupported database type: %s", dbType)
 	}
+}
+
+// handleDefaultValue converts special default values for XxLdb compatibility
+func handleDefaultValue(val interface{}) string {
+	if val == nil {
+		return "DEFAULT NULL"
+	}
+	
+	defaultStr := fmt.Sprintf("%v", val)
+	
+	// Convert CURRENT_TIMESTAMP to NOW()
+	if strings.ToUpper(defaultStr) == "CURRENT_TIMESTAMP" {
+		return "DEFAULT NOW()"
+	}
+	
+	return fmt.Sprintf("DEFAULT %v", val)
 }

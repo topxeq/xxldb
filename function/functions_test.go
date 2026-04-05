@@ -3714,3 +3714,244 @@ func TestDayOfYearEdgeCases(t *testing.T) {
 		}
 	}
 }
+
+// TestBlobHexFunctions tests BLOB_FROM_HEX and BLOB_TO_HEX
+func TestBlobHexFunctions(t *testing.T) {
+	// Test data
+	testData := []byte{0x48, 0x65, 0x6c, 0x6c, 0x6f} // "Hello"
+	expectedHex := "48656c6c6f"
+
+	// Test BLOB_TO_HEX
+	result, err := Call("BLOB_TO_HEX", []types.Value{
+		types.NewBlobValue(testData),
+	})
+	if err != nil {
+		t.Errorf("BLOB_TO_HEX failed: %v", err)
+	}
+	if result.ToString() != expectedHex {
+		t.Errorf("BLOB_TO_HEX = %s, want %s", result.ToString(), expectedHex)
+	}
+
+	// Test BLOB_FROM_HEX
+	result2, err := Call("BLOB_FROM_HEX", []types.Value{
+		types.NewStringValue(expectedHex),
+	})
+	if err != nil {
+		t.Errorf("BLOB_FROM_HEX failed: %v", err)
+	}
+	blobData, ok := result2.Data.([]byte)
+	if !ok {
+		t.Errorf("BLOB_FROM_HEX did not return []byte")
+	} else if string(blobData) != string(testData) {
+		t.Errorf("BLOB_FROM_HEX = %v, want %v", blobData, testData)
+	}
+
+	// Test with 0x prefix
+	result3, err := Call("BLOB_FROM_HEX", []types.Value{
+		types.NewStringValue("0x" + expectedHex),
+	})
+	if err != nil {
+		t.Errorf("BLOB_FROM_HEX with 0x prefix failed: %v", err)
+	}
+	blobData3, _ := result3.Data.([]byte)
+	if string(blobData3) != string(testData) {
+		t.Errorf("BLOB_FROM_HEX with 0x prefix = %v, want %v", blobData3, testData)
+	}
+
+	// Test with uppercase hex
+	result4, err := Call("BLOB_FROM_HEX", []types.Value{
+		types.NewStringValue("48656C6C6F"),
+	})
+	if err != nil {
+		t.Errorf("BLOB_FROM_HEX uppercase failed: %v", err)
+	}
+	blobData4, _ := result4.Data.([]byte)
+	if string(blobData4) != string(testData) {
+		t.Errorf("BLOB_FROM_HEX uppercase = %v, want %v", blobData4, testData)
+	}
+
+	// Test null input
+	result5, err := Call("BLOB_FROM_HEX", []types.Value{
+		types.NewNullValue(),
+	})
+	if err != nil || !result5.IsNull {
+		t.Errorf("BLOB_FROM_HEX null should return null")
+	}
+
+	// Test BLOB_TO_HEX with null
+	result6, err := Call("BLOB_TO_HEX", []types.Value{
+		types.NewNullValue(),
+	})
+	if err != nil || !result6.IsNull {
+		t.Errorf("BLOB_TO_HEX null should return null")
+	}
+}
+
+// TestBlobBase64Functions tests BLOB_FROM_BASE64 and BLOB_TO_BASE64
+func TestBlobBase64Functions(t *testing.T) {
+	testData := []byte("Hello, World!")
+	expectedBase64 := "SGVsbG8sIFdvcmxkIQ=="
+
+	// Test BLOB_TO_BASE64
+	result, err := Call("BLOB_TO_BASE64", []types.Value{
+		types.NewBlobValue(testData),
+	})
+	if err != nil {
+		t.Errorf("BLOB_TO_BASE64 failed: %v", err)
+	}
+	if result.ToString() != expectedBase64 {
+		t.Errorf("BLOB_TO_BASE64 = %s, want %s", result.ToString(), expectedBase64)
+	}
+
+	// Test BLOB_FROM_BASE64
+	result2, err := Call("BLOB_FROM_BASE64", []types.Value{
+		types.NewStringValue(expectedBase64),
+	})
+	if err != nil {
+		t.Errorf("BLOB_FROM_BASE64 failed: %v", err)
+	}
+	blobData, ok := result2.Data.([]byte)
+	if !ok {
+		t.Errorf("BLOB_FROM_BASE64 did not return []byte")
+	} else if string(blobData) != string(testData) {
+		t.Errorf("BLOB_FROM_BASE64 = %v, want %v", blobData, testData)
+	}
+
+	// Test null input
+	result3, err := Call("BLOB_FROM_BASE64", []types.Value{
+		types.NewNullValue(),
+	})
+	if err != nil || !result3.IsNull {
+		t.Errorf("BLOB_FROM_BASE64 null should return null")
+	}
+}
+
+// TestImageHexFunctions tests IMAGE_FROM_HEX and IMAGE_TO_HEX
+func TestImageHexFunctions(t *testing.T) {
+	// Minimal valid PNG (1x1 transparent pixel)
+	pngHex := "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000b49444154789c6360000200000500017a5eab3f0000000049454e44ae426082"
+
+	// Test IMAGE_FROM_HEX
+	result, err := Call("IMAGE_FROM_HEX", []types.Value{
+		types.NewStringValue(pngHex),
+	})
+	if err != nil {
+		t.Errorf("IMAGE_FROM_HEX failed: %v", err)
+	}
+	if result.Type != types.TypeImage {
+		t.Errorf("IMAGE_FROM_HEX should return IMAGE type, got %v", result.Type)
+	}
+
+	// Test IMAGE_TO_HEX
+	result2, err := Call("IMAGE_TO_HEX", []types.Value{
+		result,
+	})
+	if err != nil {
+		t.Errorf("IMAGE_TO_HEX failed: %v", err)
+	}
+	if result2.ToString() != pngHex {
+		t.Errorf("IMAGE_TO_HEX roundtrip failed: got %s", result2.ToString())
+	}
+
+	// Test with 0x prefix
+	result3, err := Call("IMAGE_FROM_HEX", []types.Value{
+		types.NewStringValue("0x" + pngHex),
+	})
+	if err != nil {
+		t.Errorf("IMAGE_FROM_HEX with 0x prefix failed: %v", err)
+	}
+	if result3.Type != types.TypeImage {
+		t.Errorf("IMAGE_FROM_HEX with 0x prefix should return IMAGE type")
+	}
+
+	// Test null input
+	result4, err := Call("IMAGE_FROM_HEX", []types.Value{
+		types.NewNullValue(),
+	})
+	if err != nil || !result4.IsNull {
+		t.Errorf("IMAGE_FROM_HEX null should return null")
+	}
+
+	// Test IMAGE_TO_HEX with null
+	result5, err := Call("IMAGE_TO_HEX", []types.Value{
+		types.NewNullValue(),
+	})
+	if err != nil || !result5.IsNull {
+		t.Errorf("IMAGE_TO_HEX null should return null")
+	}
+}
+
+// TestHexErrorCases tests error handling for hex functions
+func TestHexErrorCases(t *testing.T) {
+	// Invalid hex string (odd length)
+	_, err := Call("BLOB_FROM_HEX", []types.Value{
+		types.NewStringValue("abc"),
+	})
+	if err == nil {
+		t.Errorf("BLOB_FROM_HEX should fail with odd-length hex string")
+	}
+
+	// Invalid hex characters
+	_, err = Call("BLOB_FROM_HEX", []types.Value{
+		types.NewStringValue("ghij"),
+	})
+	if err == nil {
+		t.Errorf("BLOB_FROM_HEX should fail with invalid hex characters")
+	}
+
+	// Invalid hex for IMAGE
+	_, err = Call("IMAGE_FROM_HEX", []types.Value{
+		types.NewStringValue("abc"),
+	})
+	if err == nil {
+		t.Errorf("IMAGE_FROM_HEX should fail with odd-length hex string")
+	}
+
+	// Missing argument
+	_, err = Call("BLOB_FROM_HEX", []types.Value{})
+	if err == nil {
+		t.Errorf("BLOB_FROM_HEX should fail with no arguments")
+	}
+
+	_, err = Call("BLOB_TO_HEX", []types.Value{})
+	if err == nil {
+		t.Errorf("BLOB_TO_HEX should fail with no arguments")
+	}
+
+	_, err = Call("IMAGE_FROM_HEX", []types.Value{})
+	if err == nil {
+		t.Errorf("IMAGE_FROM_HEX should fail with no arguments")
+	}
+
+	_, err = Call("IMAGE_TO_HEX", []types.Value{})
+	if err == nil {
+		t.Errorf("IMAGE_TO_HEX should fail with no arguments")
+	}
+}
+
+// TestHexWithWhitespace tests hex decoding with whitespace
+func TestHexWithWhitespace(t *testing.T) {
+	// Hex with spaces
+	result, err := Call("BLOB_FROM_HEX", []types.Value{
+		types.NewStringValue("48 65 6c 6c 6f"),
+	})
+	if err != nil {
+		t.Errorf("BLOB_FROM_HEX with spaces failed: %v", err)
+	}
+	data, _ := result.Data.([]byte)
+	if string(data) != "Hello" {
+		t.Errorf("BLOB_FROM_HEX with spaces = %s, want Hello", string(data))
+	}
+
+	// Hex with newlines
+	result2, err := Call("BLOB_FROM_HEX", []types.Value{
+		types.NewStringValue("4865\n6c6c\n6f"),
+	})
+	if err != nil {
+		t.Errorf("BLOB_FROM_HEX with newlines failed: %v", err)
+	}
+	data2, _ := result2.Data.([]byte)
+	if string(data2) != "Hello" {
+		t.Errorf("BLOB_FROM_HEX with newlines = %s, want Hello", string(data2))
+	}
+}
