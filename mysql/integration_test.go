@@ -39,11 +39,9 @@ func TestMySQLServerBasic(t *testing.T) {
 		}
 	}
 
-	// Create MySQL server
+	// Create MySQL server (authentication handled by engine's auth system)
 	server, err := NewServer(engine, Config{
-		Addr:     ":13307",
-		Username: "admin",
-		Password: "secret",
+		Addr: ":13307",
 	})
 	if err != nil {
 		t.Fatalf("Failed to create server: %v", err)

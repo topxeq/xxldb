@@ -1371,7 +1371,7 @@ func TestCreateTableWithDefault(t *testing.T) {
 	defer engine.Close()
 
 	// Create table with DEFAULT value
-	_, err = engine.Execute("CREATE TABLE default_test (id SEQ, status VARCHAR(20) DEFAULT 'active')")
+	_, err = engine.Execute("CREATE TABLE default_test (id SEQ, stat VARCHAR(20) DEFAULT 'active')")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1383,7 +1383,7 @@ func TestCreateTableWithDefault(t *testing.T) {
 	}
 
 	// Insert with explicit value
-	_, err = engine.Execute("INSERT INTO default_test (status) VALUES ('inactive')")
+	_, err = engine.Execute("INSERT INTO default_test (stat) VALUES ('inactive')")
 	if err != nil {
 		t.Fatal(err)
 	}

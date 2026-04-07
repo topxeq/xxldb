@@ -232,6 +232,14 @@ func (w *PacketWriter) WriteOK(affectedRows, insertID uint64, status uint16, war
 	return w.WritePacket(buf.Bytes())
 }
 
+// WriteAuthMoreData writes an AuthMoreData packet (0x01 header)
+func (w *PacketWriter) WriteAuthMoreData(data []byte) error {
+	buf := make([]byte, 1+len(data))
+	buf[0] = 0x01 // AuthMoreData header
+	copy(buf[1:], data)
+	return w.WritePacket(buf)
+}
+
 // WriteEOF writes an EOF packet
 func (w *PacketWriter) WriteEOF(warnings, status uint16) error {
 	data := []byte{

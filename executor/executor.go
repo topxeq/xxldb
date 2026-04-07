@@ -44,6 +44,7 @@ type Config struct {
 	AutoCommit    bool
 	SyncInterval  int
 	BlobThreshold int64 // Size threshold for external blob storage (default: 64KB, 0 = always inline)
+	EncryptPassword string // Password for database encryption
 }
 
 // DefaultConfig returns default configuration
@@ -69,6 +70,39 @@ func NewEngineWithConfig(config Config) (*Engine, error) {
 	store, err := storage.NewStorage(config.Path, config.InMemory)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create storage: %w", err)
+	}
+
+	// Check if database is encrypted
+	if !config.InMemory && config.Path != "" {
+		isEncrypted := storage.IsDatabaseEncrypted(config.Path)
+		if isEncrypted {
+			if config.EncryptPassword == "" {
+				store.Close()
+				return nil, fmt.Errorf("database is encrypted - password required")
+			}
+			// Get salt from encrypted database
+			salt, err := storage.GetEncryptionSalt(config.Path)
+			if err != nil {
+				store.Close()
+				return nil, fmt.Errorf("failed to read encryption salt: %w", err)
+			}
+			// Set encryption with existing salt
+			if err := store.SetEncryptionWithSalt(config.EncryptPassword, salt); err != nil {
+				store.Close()
+				return nil, fmt.Errorf("failed to set encryption: %w", err)
+			}
+			// Verify password by attempting to load metadata
+			if err := store.LoadAndVerifyMetadata(); err != nil {
+				store.Close()
+				return nil, fmt.Errorf("decryption failed - wrong password: %w", err)
+			}
+		} else if config.EncryptPassword != "" {
+			// New database or unencrypted database with password - enable encryption
+			if err := store.SetEncryption(config.EncryptPassword); err != nil {
+				store.Close()
+				return nil, fmt.Errorf("failed to enable encryption: %w", err)
+			}
+		}
 	}
 
 	// Configure blob threshold if specified
@@ -97,7 +131,12 @@ func NewEngineWithConfig(config Config) (*Engine, error) {
 		engine.log.Warn("failed to initialize system tables: %v", err)
 	}
 
-	// Set credentials if provided
+	// Load auth config from storage if exists
+	if authConfig := store.GetAuthConfig(); authConfig != nil {
+		engine.auth.FromMap(authConfig)
+	}
+
+	// Set credentials if provided (overrides stored config)
 	if config.Username != "" && config.Password != "" {
 		engine.auth.SetCredentials(config.Username, config.Password)
 	}
@@ -142,6 +181,11 @@ func NewEngineWithFS(path string, inMemory bool, fs storage.FileSystem) (*Engine
 		engine.log.Warn("failed to initialize system tables: %v", err)
 	}
 
+	// Load auth config from storage if exists
+	if authConfig := store.GetAuthConfig(); authConfig != nil {
+		engine.auth.FromMap(authConfig)
+	}
+
 	return engine, nil
 }
 
@@ -170,6 +214,36 @@ func (e *Engine) Close() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.storage.Close()
+}
+
+// GetAuth returns the auth instance for authentication
+func (e *Engine) GetAuth() *auth.Auth {
+	return e.auth
+}
+
+// SetSkipSave enables or disables skip-save mode for bulk imports
+func (e *Engine) SetSkipSave(skip bool) {
+	e.storage.SetSkipSave(skip)
+}
+
+// ForceSave forces a save of the database metadata
+func (e *Engine) ForceSave() error {
+	return e.storage.ForceSave()
+}
+
+// IsEncrypted returns whether the database is encrypted
+func (e *Engine) IsEncrypted() bool {
+	return e.storage.IsEncrypted()
+}
+
+// SetEncryption enables encryption with the given password
+func (e *Engine) SetEncryption(password string) error {
+	return e.storage.SetEncryption(password)
+}
+
+// ChangeEncryptionPassword changes the encryption password
+func (e *Engine) ChangeEncryptionPassword(oldPassword, newPassword string) error {
+	return e.storage.ChangePassword(oldPassword, newPassword)
 }
 
 // ListTables returns a list of all tables in the database

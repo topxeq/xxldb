@@ -4,6 +4,7 @@ package xxldb
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // ==================== VARCHAR Length Constraint Tests ====================
@@ -33,8 +34,10 @@ func TestVarcharLengthConstraint(t *testing.T) {
 		{"exact length", "1234567890", false},
 		{"one over", "12345678901", true},
 		{"way over", "this is way too long for varchar 10", true},
-		{"unicode 3 chinese chars (9 bytes)", "你好世", false}, // 3 Chinese chars = 9 bytes < 10
-		{"unicode 4 chinese chars (12 bytes)", "你好世界", true}, // 4 Chinese chars = 12 bytes > 10
+		{"unicode 3 chinese chars", "你好世", false},              // 3 Chinese chars = 3 runes < 10
+		{"unicode 4 chinese chars", "你好世界", false},            // 4 Chinese chars = 4 runes < 10
+		{"unicode 10 chinese chars", "一二三四五六七八九十", false},  // 10 Chinese chars = 10 runes = 10
+		{"unicode 11 chinese chars", "一二三四五六七八九十壹", true}, // 11 Chinese chars = 11 runes > 10
 	}
 
 	for _, tt := range tests {
@@ -453,9 +456,11 @@ func TestCharWithUnicode(t *testing.T) {
 		{"ASCII 3 chars", "ABC", 3, false},
 		{"ASCII 10 chars", "1234567890", 10, false},
 		{"ASCII 11 chars", "12345678901", 11, true},
-		{"Chinese 3 chars (9 bytes)", "你好世", 9, false},
-		{"Chinese 4 chars (12 bytes)", "你好世界", 12, true},
-		{"Mixed ASCII+Chinese", "Hi你好", 8, false}, // 2 ASCII + 2 Chinese = 2 + 6 = 8 bytes
+		{"Chinese 3 chars", "你好世", 9, false},    // 3 Chinese chars = 3 runes < 10
+		{"Chinese 4 chars", "你好世界", 12, false},  // 4 Chinese chars = 4 runes < 10
+		{"Chinese 10 chars", "一二三四五六七八九十", 30, false}, // 10 Chinese chars = 10 runes = 10
+		{"Chinese 11 chars", "一二三四五六七八九十壹", 33, true},  // 11 Chinese chars = 11 runes > 10
+		{"Mixed ASCII+Chinese", "Hi你好", 8, false},    // 2 ASCII + 2 Chinese = 4 runes < 10
 	}
 
 	for _, tt := range tests {
@@ -477,10 +482,11 @@ func TestCharWithUnicode(t *testing.T) {
 			}
 
 			if err != nil {
-				t.Fatalf("Unexpected error for '%s' (%d bytes): %v", tt.input, tt.inputBytes, err)
+				t.Fatalf("Unexpected error for '%s': %v", tt.input, err)
 			}
 
-			// Verify padding - CHAR should always store exactly 10 bytes
+			// Verify padding - CHAR(10) stores 10 characters (runes)
+			// For Unicode, byte length can be larger (e.g., 10 Chinese chars = 30 bytes)
 			result, err := engine.Execute("SELECT name, LENGTH(name) FROM test_char_unicode_temp WHERE id = 1")
 			if err != nil {
 				t.Fatal(err)
@@ -490,21 +496,21 @@ func TestCharWithUnicode(t *testing.T) {
 			length, _ := result.Rows[0].Data[1].ToInt64()
 
 			// LENGTH() returns character count, not byte count
-			// CHAR(10) stores 10 bytes, which can be different number of characters for Unicode
-			if int(length) < 1 {
-				t.Errorf("LENGTH() should return at least 1 character, got %d", length)
+			// CHAR(10) should store exactly 10 characters
+			if int(length) != 10 {
+				t.Errorf("LENGTH() should return 10 characters, got %d", length)
 			}
 
-			// Verify stored byte length is exactly 10 (CHAR padding)
-			if len(stored) != 10 {
-				t.Errorf("Stored value should be 10 bytes, got %d", len(stored))
+			// Verify stored character count is exactly 10 (CHAR padding by characters)
+			if utf8.RuneCountInString(stored) != 10 {
+				t.Errorf("Stored value should be 10 characters, got %d", utf8.RuneCountInString(stored))
 			}
 		})
 	}
 }
 
 // TestConstraintWithUnicode tests constraints with Unicode characters
-// Note: Current implementation counts bytes, not characters
+// Note: Implementation counts characters (runes), not bytes
 func TestConstraintWithUnicode(t *testing.T) {
 	engine, err := OpenInMemory()
 	if err != nil {
@@ -512,25 +518,24 @@ func TestConstraintWithUnicode(t *testing.T) {
 	}
 	defer engine.Close()
 
-	// VARCHAR(30) - can hold 30 bytes (e.g., 10 Chinese chars = 30 bytes)
+	// VARCHAR(30) - can hold 30 characters (runes)
 	_, err = engine.Execute("CREATE TABLE test_unicode (id SEQ, name VARCHAR(30))")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// 10 unicode characters = 30 bytes (10 ASCII + 4 Chinese * 3 bytes each = 10 + 12 = 22 bytes)
-	// Actually: 你好世界Hello! = 4 Chinese (12 bytes) + 6 ASCII (6 bytes) = 18 bytes total
+	// 10 unicode characters: 你好世界Hello! = 4 Chinese + 6 ASCII = 10 runes
 	unicode10 := "你好世界Hello!"
 	_, err = engine.Execute("INSERT INTO test_unicode (name) VALUES ('" + unicode10 + "')")
 	if err != nil {
 		t.Errorf("Failed to insert unicode string: %v", err)
 	}
 
-	// String that exceeds 30 bytes
-	unicodeLong := "你好世界你好世界你好世界你好世界" // 16 Chinese chars = 48 bytes
+	// String that exceeds 30 characters (runes)
+	unicodeLong := "一二三四五六七八九十壹贰叁肆伍陆柒捌玖拾壹贰叁肆伍陆柒捌玖拾壹贰叁肆" // 31 Chinese chars = 31 runes > 30
 	_, err = engine.Execute("INSERT INTO test_unicode (name) VALUES ('" + unicodeLong + "')")
 	if err == nil {
-		t.Error("Expected error for unicode string exceeding byte limit")
+		t.Error("Expected error for unicode string exceeding character limit")
 	}
 
 	// Verify

@@ -79,8 +79,15 @@ func (d *xxldbDriver) Open(name string) (driver.Conn, error) {
 		return nil, err
 	}
 
+	// Build config with encryption password
+	config := executor.Config{
+		Path:            dsn.Path,
+		InMemory:        dsn.InMemory,
+		EncryptPassword: dsn.EncryptPassword,
+	}
+
 	if dsn.InMemory {
-		engine, err = executor.NewEngine("", true)
+		engine, err = executor.NewEngineWithConfig(config)
 	} else if dsn.SSH != nil {
 		// Create SFTP filesystem for remote access
 		fs, err := createSFTPFileSystem(dsn.Path, dsn.SSH)
@@ -109,7 +116,7 @@ func (d *xxldbDriver) Open(name string) (driver.Conn, error) {
 		// Create storage with custom filesystem
 		engine, err = executor.NewEngineWithFS(dsn.Path, false, fs)
 	} else {
-		engine, err = executor.NewEngine(dsn.Path, false)
+		engine, err = executor.NewEngineWithConfig(config)
 	}
 
 	if err != nil {

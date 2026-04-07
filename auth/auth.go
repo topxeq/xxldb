@@ -2,6 +2,7 @@
 package auth
 
 import (
+	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/hex"
 	"sync"
@@ -9,10 +10,11 @@ import (
 
 // Auth handles database authentication
 type Auth struct {
-	mu       sync.RWMutex
-	username string
-	password string // Hashed password
-	enabled  bool
+	mu           sync.RWMutex
+	username     string
+	password     string // Hashed password (SHA256)
+	mysqlSha1    []byte // MySQL SHA1 hash: SHA1(password) for MySQL protocol
+	enabled      bool
 }
 
 // NewAuth creates a new Auth instance
@@ -29,8 +31,10 @@ func (a *Auth) SetCredentials(username, password string) {
 	a.username = username
 	if password != "" {
 		a.password = hashPassword(password)
+		a.mysqlSha1 = hashPasswordMySQL(password)
 	} else {
 		a.password = "" // Clear password if empty
+		a.mysqlSha1 = nil
 	}
 	a.enabled = username != ""
 }
@@ -88,6 +92,14 @@ func (a *Auth) SetPassword(newPassword string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.password = hashPassword(newPassword)
+	a.mysqlSha1 = hashPasswordMySQL(newPassword)
+}
+
+// GetMySQLSha1 returns the MySQL SHA1 hash for MySQL protocol authentication
+func (a *Auth) GetMySQLSha1() []byte {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.mysqlSha1
 }
 
 // hashPassword creates a SHA256 hash of the password
@@ -96,15 +108,25 @@ func hashPassword(password string) string {
 	return hex.EncodeToString(hash[:])
 }
 
+// hashPasswordMySQL creates a SHA1 hash for MySQL native password authentication
+func hashPasswordMySQL(password string) []byte {
+	hash := sha1.Sum([]byte(password))
+	return hash[:]
+}
+
 // ToMap exports auth config for persistence
 func (a *Auth) ToMap() map[string]interface{} {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	return map[string]interface{}{
+	result := map[string]interface{}{
 		"username": a.username,
 		"password": a.password,
 		"enabled":  a.enabled,
 	}
+	if a.mysqlSha1 != nil {
+		result["mysql_sha1"] = hex.EncodeToString(a.mysqlSha1)
+	}
+	return result
 }
 
 // FromMap imports auth config from persistence
@@ -120,6 +142,11 @@ func (a *Auth) FromMap(m map[string]interface{}) {
 	if enabled, ok := m["enabled"].(bool); ok {
 		a.enabled = enabled
 	}
+	if mysqlSha1Hex, ok := m["mysql_sha1"].(string); ok {
+		if data, err := hex.DecodeString(mysqlSha1Hex); err == nil {
+			a.mysqlSha1 = data
+		}
+	}
 }
 
 // ClearCredentials clears all credentials
@@ -128,5 +155,6 @@ func (a *Auth) ClearCredentials() {
 	defer a.mu.Unlock()
 	a.username = ""
 	a.password = ""
+	a.mysqlSha1 = nil
 	a.enabled = false
 }

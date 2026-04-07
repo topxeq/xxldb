@@ -919,7 +919,8 @@ func (p *Parser) parseIdentOrFunction() (*Expression, error) {
 	// Check for qualified name (table.column)
 	if p.match(TokDot) {
 		p.advance()
-		if !p.match(TokIdent) {
+		// Allow keywords as column names in qualified names (e.g., t1.status)
+		if !p.match(TokIdent) && !p.match(TokKeyword) {
 			return nil, fmt.Errorf("expected column name after '.'")
 		}
 		col := p.advance().Value

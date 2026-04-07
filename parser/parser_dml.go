@@ -294,8 +294,8 @@ func (p *Parser) parseCreateTable() (*Statement, error) {
 func (p *Parser) parseColumnDef() (*ColumnDef, error) {
 	col := &ColumnDef{Nullable: true}
 
-	// Column name
-	if !p.match(TokIdent) {
+	// Column name (allow keywords as column names)
+	if !p.match(TokIdent) && !p.match(TokKeyword) {
 		return nil, fmt.Errorf("expected column name, got %s", p.current())
 	}
 	col.Name = p.advance().Value

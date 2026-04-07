@@ -2,10 +2,8 @@
 package storage
 
 import (
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
@@ -14,6 +12,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/topxeq/xxldb/storage/crypto"
 	"github.com/topxeq/xxldb/types"
 )
 
@@ -49,103 +48,10 @@ const (
 	CurrentVersion = 2
 )
 
-// PageType represents the type of a page
-type PageType uint8
-
-const (
-	PageTypeFree PageType = iota
-	PageTypeData
-	PageTypeIndex
-	PageTypeBlob
-	PageTypeMeta
+// Errors
+var (
+	ErrEncryptionKeyRequired = fmt.Errorf("encryption key required - database is encrypted")
 )
-
-// PageHeader represents the header of a page
-type PageHeader struct {
-	PageID    uint64   // Page identifier
-	PageType  PageType // Type of page
-	Flags     uint8    // Flags
-	FreeSpace uint16   // Free space offset
-	ItemCount uint16   // Number of items
-	Reserved  uint32   // Reserved for future use
-	Checksum  uint32   // CRC32 checksum
-}
-
-// Page represents a data page
-type Page struct {
-	Header  PageHeader
-	Content [MaxPageContent]byte
-}
-
-// NewPage creates a new page
-func NewPage(id uint64, typ PageType) *Page {
-	p := &Page{}
-	p.Header.PageID = id
-	p.Header.PageType = typ
-	p.Header.FreeSpace = MaxPageContent
-	p.Header.ItemCount = 0
-	return p
-}
-
-// CalculateChecksum calculates the page checksum
-func (p *Page) CalculateChecksum() uint32 {
-	data := make([]byte, PageSize)
-	binary.LittleEndian.PutUint64(data[0:8], p.Header.PageID)
-	data[8] = byte(p.Header.PageType)
-	data[9] = p.Header.Flags
-	binary.LittleEndian.PutUint16(data[10:12], p.Header.FreeSpace)
-	binary.LittleEndian.PutUint16(data[12:14], p.Header.ItemCount)
-	binary.LittleEndian.PutUint32(data[14:18], p.Header.Reserved)
-	copy(data[PageHeaderSize:], p.Content[:])
-	// Zero out checksum field for calculation
-	return crc32.ChecksumIEEE(data)
-}
-
-// VerifyChecksum verifies the page checksum
-func (p *Page) VerifyChecksum() bool {
-	return p.Header.Checksum == p.CalculateChecksum()
-}
-
-// ToBytes serializes the page to bytes
-func (p *Page) ToBytes() []byte {
-	data := make([]byte, PageSize)
-
-	// Write header
-	binary.LittleEndian.PutUint64(data[0:8], p.Header.PageID)
-	data[8] = byte(p.Header.PageType)
-	data[9] = p.Header.Flags
-	binary.LittleEndian.PutUint16(data[10:12], p.Header.FreeSpace)
-	binary.LittleEndian.PutUint16(data[12:14], p.Header.ItemCount)
-	binary.LittleEndian.PutUint32(data[14:18], p.Header.Reserved)
-	binary.LittleEndian.PutUint32(data[18:22], p.Header.Checksum)
-	// 2 bytes padding
-
-	// Write content
-	copy(data[PageHeaderSize:], p.Content[:])
-
-	return data
-}
-
-// FromBytes deserializes the page from bytes
-func (p *Page) FromBytes(data []byte) error {
-	if len(data) != PageSize {
-		return fmt.Errorf("invalid page size: %d", len(data))
-	}
-
-	// Read header
-	p.Header.PageID = binary.LittleEndian.Uint64(data[0:8])
-	p.Header.PageType = PageType(data[8])
-	p.Header.Flags = data[9]
-	p.Header.FreeSpace = binary.LittleEndian.Uint16(data[10:12])
-	p.Header.ItemCount = binary.LittleEndian.Uint16(data[12:14])
-	p.Header.Reserved = binary.LittleEndian.Uint32(data[14:18])
-	p.Header.Checksum = binary.LittleEndian.Uint32(data[18:22])
-
-	// Read content
-	copy(p.Content[:], data[PageHeaderSize:])
-
-	return nil
-}
 
 // Storage handles data persistence
 type Storage struct {
@@ -162,10 +68,11 @@ type Storage struct {
 	nextID    uint64
 
 	// Data storage
-	dataFiles map[string]File        // Table name -> file
-	pages     map[uint64]*Page       // Page cache
-	rowData   map[string][][]types.Value // Table name -> rows (in-memory storage)
-	rowIDs    map[string][]uint64        // Table name -> row IDs
+	dataFiles map[string]File        // Table name -> file (legacy)
+	tableFiles map[string]*TableFile // Table name -> TableFile (new page-based)
+	pageCache  *PageCache            // LRU page cache
+	rowData   map[string][][]types.Value // Table name -> rows (in-memory storage, legacy)
+	rowIDs    map[string][]uint64        // Table name -> row IDs (legacy)
 
 	// WAL
 	walFile   *os.File
@@ -177,8 +84,18 @@ type Storage struct {
 	// Config
 	config Config
 
+	// Auth configuration (persisted)
+	authConfig map[string]interface{}
+
 	// Full-text search indexes: "table.column" -> index info
 	ftsIndexes map[string]*FTSIndexInfo
+
+	// Encryption
+	encrypted bool
+	encryptor *crypto.Encryptor
+
+	// Skip save for bulk imports
+	skipSave bool
 }
 
 // FTSIndexInfo stores full-text index metadata
@@ -204,7 +121,7 @@ func DefaultConfig() Config {
 		CheckpointInt:  time.Minute * 5,
 		BufferSize:     1000,
 		AutoCheckpoint: true,
-		BlobThreshold:  1024 * 1024 * 1024, // 1GB - blobs larger than this are stored in separate files
+		BlobThreshold:  64 * 1024, // 64KB - blobs larger than this are stored in separate files
 	}
 }
 
@@ -228,11 +145,13 @@ func NewStorageWithFS(path string, inMemory bool, fs FileSystem) (*Storage, erro
 		sequences:  make(map[string]int64),
 		nextID:     1,
 		dataFiles:  make(map[string]File),
-		pages:      make(map[uint64]*Page),
+		tableFiles: make(map[string]*TableFile),
+		pageCache:  NewPageCache(DefaultPageCacheConfig()),
 		rowData:    make(map[string][][]types.Value),
 		rowIDs:     make(map[string][]uint64),
 		config:     DefaultConfig(),
 		ftsIndexes: make(map[string]*FTSIndexInfo),
+		authConfig: make(map[string]interface{}),
 	}
 
 	if !inMemory && path != "" {
@@ -266,15 +185,24 @@ func (s *Storage) initFileStorage() error {
 		return err
 	}
 
-	// Load existing metadata
-	if err := s.loadMetadata(); err != nil {
-		// Non-fatal: metadata might not exist yet
-	}
-
-	// Always try to recover from WAL (if exists)
-	if err := s.recoverFromWAL(); err != nil {
-		// Non-fatal: WAL might not exist yet
-		s.lastCheckpoint = time.Now()
+	// Check if metadata file is encrypted before loading
+	metaPath := s.fs.Join(s.path, MetaFileName)
+	if data, err := s.fs.ReadFile(metaPath); err == nil {
+		if crypto.IsEncryptedFile(data) {
+			// Metadata is encrypted, don't load yet - wait for password
+			s.encrypted = true
+			// Don't recover from WAL yet - will do after password is set
+		} else {
+			// Not encrypted, load normally
+			if err := s.loadMetadata(); err != nil {
+				// Non-fatal: metadata might be corrupted
+			}
+			// Recover from WAL
+			if err := s.recoverFromWAL(); err != nil {
+				// Non-fatal: WAL might not exist yet
+				s.lastCheckpoint = time.Now()
+			}
+		}
 	}
 
 	// Initialize WAL
@@ -298,11 +226,28 @@ func (s *Storage) loadMetadata() error {
 		return err
 	}
 
+	// Check if metadata is encrypted
+	if crypto.IsEncryptedFile(data) {
+		s.encrypted = true
+		// If no encryptor set, we need password to decrypt
+		if s.encryptor == nil {
+			return ErrEncryptionKeyRequired
+		}
+		// Decrypt data
+		data, err = s.encryptor.DecryptFile(data)
+		if err != nil {
+			return fmt.Errorf("failed to decrypt metadata: %w", err)
+		}
+	}
+
 	var meta struct {
-		Version   uint64                `json:"version"`
-		Tables    map[string]*TableInfo `json:"tables"`
-		Sequences map[string]int64      `json:"sequences"`
-		NextID    uint64                `json:"next_id"`
+		Version   uint64                 `json:"version"`
+		Tables    map[string]*TableInfo  `json:"tables"`
+		Sequences map[string]int64       `json:"sequences"`
+		NextID    uint64                 `json:"next_id"`
+		Auth      map[string]interface{} `json:"auth,omitempty"`
+		Encrypted bool                   `json:"encrypted,omitempty"`
+		Rows      map[string]interface{} `json:"rows,omitempty"`
 	}
 
 	if err := json.Unmarshal(data, &meta); err != nil {
@@ -318,6 +263,12 @@ func (s *Storage) loadMetadata() error {
 	if s.nextID == 0 {
 		s.nextID = 1
 	}
+	if meta.Auth != nil {
+		s.authConfig = meta.Auth
+	}
+	if meta.Encrypted {
+		s.encrypted = true
+	}
 
 	// Initialize row storage for each table
 	for name := range s.tables {
@@ -329,6 +280,63 @@ func (s *Storage) loadMetadata() error {
 		}
 	}
 
+	// Restore row data if present (support both old and new format)
+	if meta.Rows != nil {
+		for tableName, tableRowsInterface := range meta.Rows {
+			tableInfo := s.tables[tableName]
+			if tableRows, ok := tableRowsInterface.([]interface{}); ok {
+				for _, rowInterface := range tableRows {
+					// New compact format: [rowID, [rawVal1, rawVal2, ...]]
+					if rowSlice, ok := rowInterface.([]interface{}); ok && len(rowSlice) == 2 {
+						if id, ok := rowSlice[0].(float64); ok {
+							rowID := uint64(id)
+							if rowDataSlice, ok := rowSlice[1].([]interface{}); ok {
+								row := make([]types.Value, len(rowDataSlice))
+								for i, v := range rowDataSlice {
+									// Convert raw value to types.Value using table schema
+									row[i] = rawToValue(v, tableInfo, i)
+								}
+								s.rowData[tableName] = append(s.rowData[tableName], row)
+								s.rowIDs[tableName] = append(s.rowIDs[tableName], rowID)
+								continue
+							}
+						}
+					}
+					// Old format: {"_id": rowID, "_data": [...]}
+					if rowMap, ok := rowInterface.(map[string]interface{}); ok {
+						var rowID uint64
+						if id, ok := rowMap["_id"].(float64); ok {
+							rowID = uint64(id)
+						}
+						if rowDataInterface, ok := rowMap["_data"]; ok {
+							if rowDataSlice, ok := rowDataInterface.([]interface{}); ok {
+								row := make([]types.Value, len(rowDataSlice))
+								for i, v := range rowDataSlice {
+									row[i] = interfaceToValue(v)
+								}
+								s.rowData[tableName] = append(s.rowData[tableName], row)
+								s.rowIDs[tableName] = append(s.rowIDs[tableName], rowID)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+// LoadAndVerifyMetadata loads and verifies metadata (used to verify encryption password)
+func (s *Storage) LoadAndVerifyMetadata() error {
+	if err := s.loadMetadata(); err != nil {
+		return err
+	}
+	// After loading encrypted metadata, also recover from WAL
+	if err := s.recoverFromWAL(); err != nil {
+		// Non-fatal: WAL might not exist
+		s.lastCheckpoint = time.Now()
+	}
 	return nil
 }
 
@@ -338,21 +346,68 @@ func (s *Storage) saveMetadata() error {
 		return nil
 	}
 
+	// Skip if in bulk import mode
+	if s.skipSave {
+		return nil
+	}
+
+	// Prepare row data for serialization (compact format)
+	// Store raw values only, reconstruct types.Value from table schema on load
+	rowsData := make(map[string]interface{})
+	for tableName, rows := range s.rowData {
+		rowIDs := s.rowIDs[tableName]
+		// Use ultra-compact format: [[rowID, [rawVal1, rawVal2, ...]], ...]
+		// For null: store null marker as special value
+		tableRows := make([]interface{}, len(rows))
+		for i, row := range rows {
+			// Convert each value to raw data (null represented as nil)
+			rowValues := make([]interface{}, len(row))
+			for j, v := range row {
+				if v.IsNull {
+					rowValues[j] = nil
+				} else if v.BlobRef != nil {
+					// Store blob ref compactly: [1, id, size]
+					rowValues[j] = []interface{}{1, v.BlobRef.ID, v.BlobRef.Size}
+				} else {
+					rowValues[j] = v.Data
+				}
+			}
+			tableRows[i] = []interface{}{rowIDs[i], rowValues}
+		}
+		rowsData[tableName] = tableRows
+	}
+
 	meta := struct {
-		Version   uint64                `json:"version"`
-		Tables    map[string]*TableInfo `json:"tables"`
-		Sequences map[string]int64      `json:"sequences"`
-		NextID    uint64                `json:"next_id"`
+		Version   uint64                 `json:"version"`
+		Tables    map[string]*TableInfo  `json:"tables"`
+		Sequences map[string]int64       `json:"sequences"`
+		NextID    uint64                 `json:"next_id"`
+		Auth      map[string]interface{} `json:"auth,omitempty"`
+		Encrypted bool                   `json:"encrypted,omitempty"`
+		Rows      map[string]interface{} `json:"rows,omitempty"`
 	}{
 		Version:   CurrentVersion,
 		Tables:    s.tables,
 		Sequences: s.sequences,
 		NextID:    s.nextID,
+		Auth:      s.authConfig,
+		Encrypted: s.encrypted,
+		Rows:      rowsData,
 	}
 
-	data, err := json.MarshalIndent(meta, "", "  ")
+	// Use compact JSON (no indent) to reduce size
+	data, err := json.Marshal(meta)
 	if err != nil {
 		return fmt.Errorf("failed to marshal metadata: %w", err)
+	}
+
+	// Encrypt if encryption is enabled
+	if s.encrypted && s.encryptor != nil {
+		encryptedData, err := s.encryptor.EncryptFile(data)
+		if err != nil {
+			return fmt.Errorf("failed to encrypt metadata: %w", err)
+		}
+		data = encryptedData
 	}
 
 	metaPath := s.fs.Join(s.path, MetaFileName)
@@ -372,6 +427,38 @@ func (s *Storage) saveMetadata() error {
 	if err := s.fs.Rename(tempPath, metaPath); err != nil {
 		s.fs.Remove(tempPath)
 		return fmt.Errorf("failed to rename metadata file: %w", err)
+	}
+
+	return nil
+}
+
+// SetSkipSave enables or disables skip-save mode for bulk imports
+// When enabled, saveMetadata() is a no-op until disabled
+func (s *Storage) SetSkipSave(skip bool) {
+	s.skipSave = skip
+}
+
+// ForceSave forces a save even if skipSave is enabled, and truncates WAL
+func (s *Storage) ForceSave() error {
+	// Temporarily disable skipSave
+	oldSkip := s.skipSave
+	s.skipSave = false
+	defer func() { s.skipSave = oldSkip }()
+
+	// Now save metadata
+	if err := s.saveMetadata(); err != nil {
+		return err
+	}
+
+	// Truncate WAL after successful save (all data is now in metadata)
+	if s.walFile != nil {
+		if err := s.walFile.Truncate(0); err != nil {
+			return fmt.Errorf("failed to truncate WAL: %w", err)
+		}
+		if _, err := s.walFile.Seek(0, 0); err != nil {
+			return fmt.Errorf("failed to reset WAL: %w", err)
+		}
+		s.walSeq = 0
 	}
 
 	return nil
@@ -402,10 +489,6 @@ func (s *Storage) CreateTable(info *types.TableInfo) error {
 
 	s.tables[info.Name] = tableInfo
 
-	// Initialize row data storage for this table
-	s.rowData[info.Name] = make([][]types.Value, 0)
-	s.rowIDs[info.Name] = make([]uint64, 0)
-
 	// Initialize sequence for auto-increment columns
 	for _, col := range info.Columns {
 		if col.AutoInc || col.Type == types.TypeSeq {
@@ -413,8 +496,22 @@ func (s *Storage) CreateTable(info *types.TableInfo) error {
 		}
 	}
 
-	// Log to WAL
+	// Create table file for V2 format (if persistent storage)
 	if s.enabled {
+		// Ensure data directory exists
+		dataDir := filepath.Join(s.path, DataDirName)
+		if err := os.MkdirAll(dataDir, 0755); err != nil {
+			return fmt.Errorf("failed to create data directory: %w", err)
+		}
+
+		// Create table file
+		tf, err := CreateTableFile(s, info.Name, info.ID, info.Columns)
+		if err != nil {
+			return fmt.Errorf("failed to create table file: %w", err)
+		}
+		s.tableFiles[info.Name] = tf
+
+		// Log to WAL
 		if err := s.writeWAL(WALRecord{
 			Type:    WALTypeCreateTable,
 			TableID: info.ID,
@@ -425,6 +522,10 @@ func (s *Storage) CreateTable(info *types.TableInfo) error {
 		if err := s.saveMetadata(); err != nil {
 			return err
 		}
+	} else {
+		// In-memory mode: use legacy storage
+		s.rowData[info.Name] = make([][]types.Value, 0)
+		s.rowIDs[info.Name] = make([]uint64, 0)
 	}
 
 	return nil
@@ -528,6 +629,18 @@ func (s *Storage) RenameTable(oldName, newName string) error {
 	delete(s.tables, oldName)
 	s.tables[newName] = info
 
+	// Handle V2 format (table files)
+	if tf, ok := s.tableFiles[oldName]; ok {
+		delete(s.tableFiles, oldName)
+		s.tableFiles[newName] = tf
+		// Rename the physical file
+		oldPath := filepath.Join(s.path, DataDirName, oldName+TableFileExt)
+		newPath := filepath.Join(s.path, DataDirName, newName+TableFileExt)
+		if _, err := os.Stat(oldPath); err == nil {
+			os.Rename(oldPath, newPath)
+		}
+	}
+
 	// Move data file reference
 	if file, ok := s.dataFiles[oldName]; ok {
 		delete(s.dataFiles, oldName)
@@ -583,6 +696,23 @@ func (s *Storage) TruncateTable(name string) error {
 		return fmt.Errorf("table %s does not exist", name)
 	}
 
+	// Check if using V2 format (page-based storage)
+	if tf, exists := s.tableFiles[name]; exists {
+		// Clear the table file
+		if err := tf.Clear(); err != nil {
+			return err
+		}
+		// Reset sequences
+		for _, col := range info.Columns {
+			if col.AutoInc || col.Type == types.TypeSeq {
+				s.sequences[name+"_"+col.Name] = 0
+			}
+		}
+		info.RowCount = 0
+		info.UpdatedAt = time.Now()
+		return nil
+	}
+
 	// Clear row data
 	s.rowData[name] = make([][]types.Value, 0)
 	s.rowIDs[name] = make([]uint64, 0)
@@ -634,13 +764,15 @@ func (s *Storage) InsertRow(tableName string, row []types.Value) (uint64, int64,
 		// Handle CHAR type: pad with spaces to fixed length
 		if col.Type == types.TypeChar && col.Length > 0 && !row[i].IsNull {
 			strVal := row[i].ToString()
-			if utf8.RuneCountInString(strVal) > col.Length {
-				return 0, 0, fmt.Errorf("value too long for column '%s': max length %d, got %d", col.Name, col.Length, utf8.RuneCountInString(strVal))
+			runeCount := utf8.RuneCountInString(strVal)
+			if runeCount > col.Length {
+				return 0, 0, fmt.Errorf("value too long for column '%s': max length %d, got %d", col.Name, col.Length, runeCount)
 			}
-			// Pad with trailing spaces to fixed length
-			if len(strVal) < col.Length {
-				padded := strVal + strings.Repeat(" ", col.Length-len(strVal))
-				row[i] = types.NewStringValue(padded)
+			// Pad with trailing spaces to fixed length (by characters, not bytes)
+			if runeCount < col.Length {
+				runes := []rune(strVal)
+				paddedRunes := append(runes, []rune(strings.Repeat(" ", col.Length-runeCount))...)
+				row[i] = types.NewStringValue(string(paddedRunes))
 			}
 		}
 
@@ -679,6 +811,35 @@ func (s *Storage) InsertRow(tableName string, row []types.Value) (uint64, int64,
 	rowID := s.nextID
 	s.nextID++
 
+	// Check if using V2 format (page-based storage)
+	if tf, exists := s.tableFiles[tableName]; exists {
+		// V2 format: use TableFile
+		insertedRowID, err := tf.InsertRow(row)
+		if err != nil {
+			return 0, 0, err
+		}
+		info.RowCount++
+		info.UpdatedAt = time.Now()
+		return insertedRowID, lastInsertID, nil
+	}
+
+	// Check if data file exists for V2 format
+	dataPath := filepath.Join(s.path, DataDirName, tableName+TableFileExt)
+	if _, err := os.Stat(dataPath); err == nil {
+		// Open table file and use V2 format
+		tf, err := s.getTableFileLocked(tableName)
+		if err == nil {
+			insertedRowID, err := tf.InsertRow(row)
+			if err != nil {
+				return 0, 0, err
+			}
+			info.RowCount++
+			info.UpdatedAt = time.Now()
+			return insertedRowID, lastInsertID, nil
+		}
+	}
+
+	// V1 format: use in-memory storage
 	// Log to WAL
 	if s.enabled {
 		if err := s.writeWAL(WALRecord{
@@ -708,6 +869,36 @@ func (s *Storage) InsertRow(tableName string, row []types.Value) (uint64, int64,
 	return rowID, lastInsertID, nil
 }
 
+// getTableFileLocked gets or creates a TableFile while already holding the lock
+func (s *Storage) getTableFileLocked(tableName string) (*TableFile, error) {
+	if tf, exists := s.tableFiles[tableName]; exists {
+		return tf, nil
+	}
+
+	tableInfo, exists := s.tables[tableName]
+	if !exists {
+		return nil, fmt.Errorf("table %s does not exist", tableName)
+	}
+
+	dataPath := filepath.Join(s.path, DataDirName, tableName+TableFileExt)
+	if _, err := os.Stat(dataPath); err == nil {
+		tf, err := OpenTableFile(s, tableName)
+		if err != nil {
+			return nil, err
+		}
+		s.tableFiles[tableName] = tf
+		return tf, nil
+	}
+
+	// Create new table file
+	tf, err := CreateTableFile(s, tableName, tableInfo.ID, tableInfo.Columns)
+	if err != nil {
+		return nil, err
+	}
+	s.tableFiles[tableName] = tf
+	return tf, nil
+}
+
 // processBlobValue checks if a blob value should be stored externally
 // and returns either the original value or a blob reference
 func (s *Storage) processBlobValue(val types.Value) types.Value {
@@ -735,7 +926,18 @@ func (s *Storage) processBlobValue(val types.Value) types.Value {
 			return val
 		}
 
-		if err := s.fs.WriteFile(blobPath, data, PermFile); err != nil {
+		// Encrypt blob data if encryption is enabled
+		writeData := data
+		if s.encrypted && s.encryptor != nil {
+			encrypted, err := s.encryptor.Encrypt(data)
+			if err != nil {
+				// If encryption fails, store inline
+				return val
+			}
+			writeData = encrypted
+		}
+
+		if err := s.fs.WriteFile(blobPath, writeData, PermFile); err != nil {
 			// If we can't write the file, store inline
 			return val
 		}
@@ -757,21 +959,33 @@ func (s *Storage) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Close all data files
+	// Flush and close all table files
+	for name, tf := range s.tableFiles {
+		tf.Flush()
+		tf.Close()
+		delete(s.tableFiles, name)
+	}
+
+	// Close all data files (legacy)
 	for _, file := range s.dataFiles {
 		file.Close()
+	}
+
+	// Save metadata and truncate WAL
+	if s.enabled {
+		if err := s.saveMetadata(); err != nil {
+			return err
+		}
+		// Truncate WAL after saving metadata
+		if s.walFile != nil {
+			s.walFile.Truncate(0)
+			s.walFile.Seek(0, 0)
+		}
 	}
 
 	// Close WAL
 	if s.walFile != nil {
 		s.walFile.Close()
-	}
-
-	// Save metadata
-	if s.enabled {
-		if err := s.saveMetadata(); err != nil {
-			return err
-		}
 	}
 
 	return nil
@@ -873,6 +1087,47 @@ func (s *Storage) GetRows(tableName string) ([][]types.Value, error) {
 		return nil, fmt.Errorf("table %s does not exist", tableName)
 	}
 
+	// Check if using V2 format (page-based storage)
+	if tf, exists := s.tableFiles[tableName]; exists {
+		rows, err := tf.GetAllRows()
+		if err != nil {
+			return nil, err
+		}
+		// Resolve blob references
+		result := make([][]types.Value, len(rows))
+		for i, row := range rows {
+			result[i] = make([]types.Value, len(row))
+			for j, val := range row {
+				result[i][j] = s.resolveBlobRef(val)
+			}
+		}
+		return result, nil
+	}
+
+	// Check if data file exists for V2 format
+	dataPath := filepath.Join(s.path, DataDirName, tableName+TableFileExt)
+	if _, err := os.Stat(dataPath); err == nil {
+		// Open table file and use V2 format
+		tf, err := OpenTableFile(s, tableName)
+		if err == nil {
+			s.tableFiles[tableName] = tf
+			rows, err := tf.GetAllRows()
+			if err != nil {
+				return nil, err
+			}
+			// Resolve blob references
+			result := make([][]types.Value, len(rows))
+			for i, row := range rows {
+				result[i] = make([]types.Value, len(row))
+				for j, val := range row {
+					result[i][j] = s.resolveBlobRef(val)
+				}
+			}
+			return result, nil
+		}
+	}
+
+	// V1 format: use in-memory storage
 	rows, exists := s.rowData[tableName]
 	if !exists {
 		return [][]types.Value{}, nil
@@ -983,6 +1238,43 @@ func (s *Storage) UpdateRows(tableName string, updates map[int]types.Value, cond
 		return 0, fmt.Errorf("table %s does not exist", tableName)
 	}
 
+	// Check if using V2 format (page-based storage)
+	if tf, exists := s.tableFiles[tableName]; exists {
+		var count int64
+		// Get all rows, find matching ones, update them
+		rows, err := tf.GetAllRows()
+		if err != nil {
+			return 0, err
+		}
+		for _, row := range rows {
+			if condition(row) {
+				// Apply updates
+				for colIdx, val := range updates {
+					if colIdx < len(row) {
+						row[colIdx] = val
+					}
+				}
+				count++
+			}
+		}
+		// For V2, we need to rewrite the table
+		// Simple approach: clear and re-insert all rows
+		if count > 0 {
+			// Get current page ID assignment
+			// Clear the table file and re-insert
+			tf.Clear()
+			for _, row := range rows {
+				_, err := tf.InsertRow(row)
+				if err != nil {
+					return 0, err
+				}
+			}
+			info.RowCount = int64(len(rows))
+			info.UpdatedAt = time.Now()
+		}
+		return count, nil
+	}
+
 	rows, exists := s.rowData[tableName]
 	if !exists {
 		return 0, nil
@@ -1045,16 +1337,18 @@ func (s *Storage) UpdateRowsWithFunc(tableName string, updateFunc func([]types.V
 		}
 		col := info.Columns[colIdx]
 
-		// Handle CHAR type: pad with spaces to fixed length
+		// Handle CHAR type: pad with spaces to fixed length (by characters, not bytes)
 		if col.Type == types.TypeChar && col.Length > 0 && !val.IsNull {
 			strVal := val.ToString()
-			if utf8.RuneCountInString(strVal) > col.Length {
-				return val, fmt.Errorf("value too long for column '%s': max length %d, got %d", col.Name, col.Length, utf8.RuneCountInString(strVal))
+			runeCount := utf8.RuneCountInString(strVal)
+			if runeCount > col.Length {
+				return val, fmt.Errorf("value too long for column '%s': max length %d, got %d", col.Name, col.Length, runeCount)
 			}
 			// Pad with trailing spaces to fixed length
-			if len(strVal) < col.Length {
-				padded := strVal + strings.Repeat(" ", col.Length-len(strVal))
-				return types.NewStringValue(padded), nil
+			if runeCount < col.Length {
+				runes := []rune(strVal)
+				paddedRunes := append(runes, []rune(strings.Repeat(" ", col.Length-runeCount))...)
+				return types.NewStringValue(string(paddedRunes)), nil
 			}
 		}
 
@@ -1125,6 +1419,37 @@ func (s *Storage) DeleteRows(tableName string, condition func([]types.Value) boo
 		return 0, fmt.Errorf("table %s does not exist", tableName)
 	}
 
+	// Check if using V2 format (page-based storage)
+	if tf, exists := s.tableFiles[tableName]; exists {
+		var count int64
+		// Get all rows, filter out matching ones
+		rows, err := tf.GetAllRows()
+		if err != nil {
+			return 0, err
+		}
+		var newRows [][]types.Value
+		for _, row := range rows {
+			if condition(row) {
+				count++
+			} else {
+				newRows = append(newRows, row)
+			}
+		}
+		if count > 0 {
+			// Clear and re-insert remaining rows
+			tf.Clear()
+			for _, row := range newRows {
+				_, err := tf.InsertRow(row)
+				if err != nil {
+					return 0, err
+				}
+			}
+			info.RowCount = int64(len(newRows))
+			info.UpdatedAt = time.Now()
+		}
+		return count, nil
+	}
+
 	rows, exists := s.rowData[tableName]
 	if !exists {
 		return 0, nil
@@ -1179,7 +1504,23 @@ func (s *Storage) ReadBlob(blobID uint64) ([]byte, error) {
 	}
 
 	blobPath := s.getBlobPath(blobID)
-	return s.fs.ReadFile(blobPath)
+	data, err := s.fs.ReadFile(blobPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// Decrypt if encryption is enabled
+	if s.encrypted && s.encryptor != nil {
+		decrypted, err := s.encryptor.Decrypt(data)
+		if err != nil {
+			// If decryption fails, the data might not be encrypted (legacy)
+			// Return original data
+			return data, nil
+		}
+		return decrypted, nil
+	}
+
+	return data, nil
 }
 
 // WriteBlob writes a blob to storage
@@ -1202,7 +1543,17 @@ func (s *Storage) WriteBlob(data []byte) (uint64, error) {
 		return 0, err
 	}
 
-	if err := s.fs.WriteFile(blobPath, data, PermFile); err != nil {
+	// Encrypt if encryption is enabled
+	writeData := data
+	if s.encrypted && s.encryptor != nil {
+		encrypted, err := s.encryptor.Encrypt(data)
+		if err != nil {
+			return 0, fmt.Errorf("failed to encrypt blob: %w", err)
+		}
+		writeData = encrypted
+	}
+
+	if err := s.fs.WriteFile(blobPath, writeData, PermFile); err != nil {
 		return 0, err
 	}
 
@@ -1276,7 +1627,7 @@ func (s *Storage) Stats() map[string]interface{} {
 		"tables":     len(s.tables),
 		"sequences":  len(s.sequences),
 		"next_id":    s.nextID,
-		"page_cache": len(s.pages),
+		"page_cache": 0, // Will be implemented with PageCache
 	}
 }
 
@@ -1292,6 +1643,204 @@ func (s *Storage) SetConfig(config Config) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.config = config
+}
+
+// GetAuthConfig returns the stored auth configuration
+func (s *Storage) GetAuthConfig() map[string]interface{} {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.authConfig == nil {
+		return nil
+	}
+	// Return a copy
+	result := make(map[string]interface{})
+	for k, v := range s.authConfig {
+		result[k] = v
+	}
+	return result
+}
+
+// SetAuthConfig updates the auth configuration and saves metadata
+func (s *Storage) SetAuthConfig(authConfig map[string]interface{}) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.authConfig = authConfig
+	return s.saveMetadata()
+}
+
+// IsEncrypted returns whether the storage is encrypted
+func (s *Storage) IsEncrypted() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.encrypted
+}
+
+// SetEncryption enables or disables encryption
+func (s *Storage) SetEncryption(password string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if password == "" {
+		// Disable encryption
+		s.encrypted = false
+		s.encryptor = nil
+		return nil
+	}
+
+	// Generate salt for new encryption
+	salt, err := crypto.GenerateSalt()
+	if err != nil {
+		return fmt.Errorf("failed to generate salt: %w", err)
+	}
+
+	// Create encryptor
+	encryptor, err := crypto.NewEncryptor(password, salt)
+	if err != nil {
+		return fmt.Errorf("failed to create encryptor: %w", err)
+	}
+
+	s.encrypted = true
+	s.encryptor = encryptor
+
+	// If metadata file exists and is encrypted, load it
+	if s.fs != nil {
+		metaPath := s.fs.Join(s.path, MetaFileName)
+		if data, err := s.fs.ReadFile(metaPath); err == nil {
+			if crypto.IsEncryptedFile(data) {
+				// Load existing encrypted metadata
+				if err := s.loadMetadata(); err != nil {
+					return fmt.Errorf("failed to load metadata: %w", err)
+				}
+				// Recover from WAL
+				if err := s.recoverFromWAL(); err != nil {
+					// Non-fatal
+				}
+				return nil
+			}
+		}
+	}
+
+	// Save metadata with encryption enabled (new database)
+	if s.enabled {
+		return s.saveMetadata()
+	}
+	return nil
+}
+
+// SetEncryptionWithSalt enables encryption with existing salt (for opening encrypted DB)
+func (s *Storage) SetEncryptionWithSalt(password string, salt []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if password == "" {
+		return fmt.Errorf("password required for encrypted database")
+	}
+
+	encryptor, err := crypto.NewEncryptor(password, salt)
+	if err != nil {
+		return fmt.Errorf("failed to create encryptor: %w", err)
+	}
+
+	s.encrypted = true
+	s.encryptor = encryptor
+	return nil
+}
+
+// GetEncryptionSalt returns the salt used for encryption
+func (s *Storage) GetEncryptionSalt() []byte {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.encryptor == nil {
+		return nil
+	}
+	return s.encryptor.GetSalt()
+}
+
+// encryptData encrypts data if encryption is enabled
+func (s *Storage) encryptData(data []byte) ([]byte, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if !s.encrypted || s.encryptor == nil {
+		return data, nil
+	}
+
+	return s.encryptor.EncryptFile(data)
+}
+
+// decryptData decrypts data if encryption is enabled
+func (s *Storage) decryptData(data []byte) ([]byte, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if !s.encrypted || s.encryptor == nil {
+		return data, nil
+	}
+
+	// Check if data is encrypted
+	if !crypto.IsEncryptedFile(data) {
+		return data, nil
+	}
+
+	return s.encryptor.DecryptFile(data)
+}
+
+// ChangePassword changes the encryption password
+func (s *Storage) ChangePassword(oldPassword, newPassword string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Verify old password if currently encrypted
+	if s.encrypted && s.encryptor != nil {
+		// Try to decrypt metadata to verify password
+		metaPath := s.fs.Join(s.path, MetaFileName)
+		data, err := s.fs.ReadFile(metaPath)
+		if err == nil && crypto.IsEncryptedFile(data) {
+			// Verify old password can decrypt
+			// TXDEF doesn't use salt, pass nil
+			oldEncryptor, err := crypto.NewEncryptor(oldPassword, nil)
+			if err != nil {
+				return fmt.Errorf("invalid old password")
+			}
+			_, err = oldEncryptor.DecryptFile(data)
+			if err != nil {
+				return fmt.Errorf("invalid old password")
+			}
+		}
+	}
+
+	// Set new password
+	if newPassword == "" {
+		s.encrypted = false
+		s.encryptor = nil
+	} else {
+		// TXDEF doesn't use salt, pass nil
+		encryptor, err := crypto.NewEncryptor(newPassword, nil)
+		if err != nil {
+			return fmt.Errorf("failed to create encryptor: %w", err)
+		}
+		s.encrypted = true
+		s.encryptor = encryptor
+	}
+
+	// Re-save all data with new encryption
+	if err := s.saveMetadata(); err != nil {
+		return err
+	}
+
+	// Truncate WAL to avoid issues with old encryption
+	// All data should be in metadata after saveMetadata()
+	if s.walFile != nil {
+		if err := s.walFile.Truncate(0); err != nil {
+			return fmt.Errorf("failed to truncate WAL: %w", err)
+		}
+		if _, err := s.walFile.Seek(0, 0); err != nil {
+			return fmt.Errorf("failed to seek WAL: %w", err)
+		}
+		s.walSeq = 0
+	}
+
+	return nil
 }
 
 // CreateFTSIndex creates a full-text search index
@@ -1422,4 +1971,31 @@ func (s *Storage) Writer() (io.WriteCloser, uint64, error) {
 	}
 
 	return file, blobID, nil
+}
+
+// IsDatabaseEncrypted checks if a database at the given path is encrypted
+func IsDatabaseEncrypted(path string) bool {
+	metaPath := filepath.Join(path, MetaFileName)
+	data, err := os.ReadFile(metaPath)
+	if err != nil {
+		return false
+	}
+	return crypto.IsEncryptedFile(data)
+}
+
+// GetEncryptionSalt reads the salt from an encrypted database
+// Note: TXDEF encryption doesn't use salt, so this returns nil for compatibility
+func GetEncryptionSalt(path string) ([]byte, error) {
+	metaPath := filepath.Join(path, MetaFileName)
+	data, err := os.ReadFile(metaPath)
+	if err != nil {
+		return nil, err
+	}
+
+	if !crypto.IsEncryptedFile(data) {
+		return nil, fmt.Errorf("database is not encrypted")
+	}
+
+	// TXDEF doesn't use salt - return nil for compatibility
+	return nil, nil
 }

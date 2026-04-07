@@ -61,7 +61,8 @@ func (s *SQLiteImporter) Disconnect() error {
 // ListTables lists all tables in the database
 func (s *SQLiteImporter) ListTables(dbName string) ([]string, error) {
 	// SQLite doesn't have multiple databases, dbName is ignored
-	query := "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_%'"
+	// Use ESCAPE to properly match literal underscore
+	query := "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '\\_%' ESCAPE '\\'"
 
 	rows, err := s.db.Query(query)
 	if err != nil {

@@ -168,6 +168,14 @@ func (m *ImportManager) ImportTable(config *ImportConfig) (*ImportResult, error)
 		return nil, fmt.Errorf("failed to get row count: %w", err)
 	}
 
+	// Enable skip-save mode for bulk import
+	m.engine.SetSkipSave(true)
+	defer func() {
+		// Disable skip-save and force save
+		m.engine.SetSkipSave(false)
+		m.engine.ForceSave()
+	}()
+
 	// Import data in batches
 	batchSize := config.BatchSize
 	if batchSize <= 0 {
@@ -367,15 +375,21 @@ func (m *ImportManager) isPartOfMultiColumnUnique(colName string, schema *TableS
 	return false
 }
 
-// insertRows inserts rows into a table
+// insertRows inserts rows into a table using batch INSERT for better performance
 func (m *ImportManager) insertRows(tableName string, schema *TableSchema, rows [][]interface{}) error {
 	if len(rows) == 0 {
 		return nil
 	}
 
-	// Insert each row using SQL statements
+	// Build column names
+	var colNames []string
+	for _, col := range schema.Columns {
+		colNames = append(colNames, col.Name)
+	}
+
+	// Build batch VALUES clause
+	var allValues []string
 	for _, row := range rows {
-		// Build VALUES clause
 		var valueStrs []string
 		for i, val := range row {
 			converted := m.convertValue(val, schema.Columns[i].TargetType)
@@ -394,11 +408,17 @@ func (m *ImportManager) insertRows(tableName string, schema *TableSchema, rows [
 				}
 			}
 		}
+		allValues = append(allValues, fmt.Sprintf("(%s)", strings.Join(valueStrs, ", ")))
+	}
 
-		insertSQL := fmt.Sprintf("INSERT INTO %s VALUES (%s)", tableName, strings.Join(valueStrs, ", "))
-		if _, err := m.engine.Execute(insertSQL); err != nil {
-			return err
-		}
+	// Execute batch INSERT (all rows in one statement)
+	insertSQL := fmt.Sprintf("INSERT INTO %s (%s) VALUES %s",
+		tableName,
+		strings.Join(colNames, ", "),
+		strings.Join(allValues, ", "))
+
+	if _, err := m.engine.Execute(insertSQL); err != nil {
+		return err
 	}
 
 	return nil
@@ -442,8 +462,8 @@ func (m *ImportManager) convertValue(val interface{}, targetType types.DataType)
 	return val
 }
 
-// ParseDSN parses a DSN string and returns database type and connection info
-func ParseDSN(dsn string) (DatabaseType, string, error) {
+// ParseDSN parses a DSN string and returns database type, connection info, and database name
+func ParseDSN(dsn string) (DatabaseType, string, string, error) {
 	// DSN format: <type>://<connection_string>
 	// Examples:
 	//   mysql://user:pass@host:3306/dbname
@@ -454,17 +474,44 @@ func ParseDSN(dsn string) (DatabaseType, string, error) {
 
 	parts := strings.SplitN(dsn, "://", 2)
 	if len(parts) != 2 {
-		return "", "", fmt.Errorf("invalid DSN format, expected: <type>://<connection_string>")
+		return "", "", "", fmt.Errorf("invalid DSN format, expected: <type>://<connection_string>")
 	}
 
 	dbType := DatabaseType(strings.ToLower(parts[0]))
 	connStr := parts[1]
 
+	// Extract database name from connection string
+	var dbName string
+	switch dbType {
+	case DatabaseTypeMySQL, DatabaseTypePostgreSQL, DatabaseTypeMSSQL:
+		// Format: user:pass@host:port/dbname or user:pass@tcp(host:port)/dbname
+		if slashIdx := strings.LastIndex(connStr, "/"); slashIdx != -1 {
+			dbName = connStr[slashIdx+1:]
+			// Remove query parameters if any
+			if qIdx := strings.Index(dbName, "?"); qIdx != -1 {
+				dbName = dbName[:qIdx]
+			}
+		}
+	case DatabaseTypeSQLite:
+		// For SQLite, the database name is the file name without extension
+		if slashIdx := strings.LastIndex(connStr, "/"); slashIdx != -1 {
+			dbName = connStr[slashIdx+1:]
+			if dotIdx := strings.LastIndex(dbName, "."); dotIdx != -1 {
+				dbName = dbName[:dotIdx]
+			}
+		}
+	case DatabaseTypeOracle:
+		// Format: user:pass@host:port/sid
+		if slashIdx := strings.LastIndex(connStr, "/"); slashIdx != -1 {
+			dbName = connStr[slashIdx+1:]
+		}
+	}
+
 	switch dbType {
 	case DatabaseTypeMySQL, DatabaseTypePostgreSQL, DatabaseTypeSQLite, DatabaseTypeOracle, DatabaseTypeMSSQL:
-		return dbType, connStr, nil
+		return dbType, connStr, dbName, nil
 	default:
-		return "", "", fmt.Errorf("unsupported database type: %s", dbType)
+		return "", "", "", fmt.Errorf("unsupported database type: %s", dbType)
 	}
 }
 

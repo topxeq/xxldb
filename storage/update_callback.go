@@ -32,16 +32,18 @@ func (s *Storage) UpdateRowsWithCallback(tableName string, updateFunc func([]typ
 		}
 		col := info.Columns[colIdx]
 
-		// Handle CHAR type: pad with spaces to fixed length
+		// Handle CHAR type: pad with spaces to fixed length (by characters, not bytes)
 		if col.Type == types.TypeChar && col.Length > 0 && !val.IsNull {
 			strVal := val.ToString()
-			if utf8.RuneCountInString(strVal) > col.Length {
-				return val, fmt.Errorf("value too long for column '%s': max length %d, got %d", col.Name, col.Length, utf8.RuneCountInString(strVal))
+			runeCount := utf8.RuneCountInString(strVal)
+			if runeCount > col.Length {
+				return val, fmt.Errorf("value too long for column '%s': max length %d, got %d", col.Name, col.Length, runeCount)
 			}
 			// Pad with trailing spaces to fixed length
-			if len(strVal) < col.Length {
-				padded := strVal + strings.Repeat(" ", col.Length-len(strVal))
-				return types.NewStringValue(padded), nil
+			if runeCount < col.Length {
+				runes := []rune(strVal)
+				paddedRunes := append(runes, []rune(strings.Repeat(" ", col.Length-runeCount))...)
+				return types.NewStringValue(string(paddedRunes)), nil
 			}
 		}
 

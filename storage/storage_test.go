@@ -179,7 +179,7 @@ func TestInMemoryStorage(t *testing.T) {
 }
 
 func TestNewPage(t *testing.T) {
-	page := NewPage(1, PageTypeData)
+	page := NewPageV2(1, PageTypeData)
 
 	if page.Header.PageID != 1 {
 		t.Errorf("PageID = %d, want 1", page.Header.PageID)
@@ -187,16 +187,16 @@ func TestNewPage(t *testing.T) {
 	if page.Header.PageType != PageTypeData {
 		t.Errorf("PageType = %v, want PageTypeData", page.Header.PageType)
 	}
-	if page.Header.FreeSpace != MaxPageContent {
-		t.Errorf("FreeSpace = %d, want %d", page.Header.FreeSpace, MaxPageContent)
+	if page.Header.FreeSpace != MaxPageContentV2 {
+		t.Errorf("FreeSpace = %d, want %d", page.Header.FreeSpace, MaxPageContentV2)
 	}
-	if page.Header.ItemCount != 0 {
-		t.Errorf("ItemCount = %d, want 0", page.Header.ItemCount)
+	if page.Header.CellCount != 0 {
+		t.Errorf("CellCount = %d, want 0", page.Header.CellCount)
 	}
 }
 
 func TestPageChecksum(t *testing.T) {
-	page := NewPage(1, PageTypeData)
+	page := NewPageV2(1, PageTypeData)
 
 	// Calculate and set checksum
 	page.Header.Checksum = page.CalculateChecksum()
@@ -214,21 +214,21 @@ func TestPageChecksum(t *testing.T) {
 }
 
 func TestPageSerialization(t *testing.T) {
-	page := NewPage(1, PageTypeData)
+	page := NewPageV2(1, PageTypeData)
 	page.Header.Flags = 5
 	page.Header.FreeSpace = 4000
-	page.Header.ItemCount = 10
+	page.Header.CellCount = 10
 	page.Content[0] = 42
 	page.Header.Checksum = page.CalculateChecksum()
 
 	// Serialize
 	data := page.ToBytes()
-	if len(data) != PageSize {
-		t.Errorf("Serialized size = %d, want %d", len(data), PageSize)
+	if len(data) != PageSize16KB {
+		t.Errorf("Serialized size = %d, want %d", len(data), PageSize16KB)
 	}
 
 	// Deserialize
-	page2 := &Page{}
+	page2 := &PageV2{}
 	err := page2.FromBytes(data)
 	if err != nil {
 		t.Fatalf("FromBytes failed: %v", err)
@@ -246,8 +246,8 @@ func TestPageSerialization(t *testing.T) {
 	if page2.Header.FreeSpace != page.Header.FreeSpace {
 		t.Errorf("FreeSpace mismatch")
 	}
-	if page2.Header.ItemCount != page.Header.ItemCount {
-		t.Errorf("ItemCount mismatch")
+	if page2.Header.CellCount != page.Header.CellCount {
+		t.Errorf("CellCount mismatch")
 	}
 	if page2.Content[0] != page.Content[0] {
 		t.Errorf("Content mismatch")
@@ -255,7 +255,7 @@ func TestPageSerialization(t *testing.T) {
 }
 
 func TestPageFromBytesInvalid(t *testing.T) {
-	page := &Page{}
+	page := &PageV2{}
 	err := page.FromBytes([]byte{1, 2, 3})
 	if err == nil {
 		t.Error("FromBytes should fail with invalid size")

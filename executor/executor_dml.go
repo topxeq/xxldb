@@ -591,9 +591,17 @@ func (e *Engine) executeSet(stmt *parser.Statement) (*Result, error) {
 	switch setVar {
 	case "USER":
 		e.auth.SetCredentials(value, "")
+		// Persist auth config
+		if err := e.storage.SetAuthConfig(e.auth.ToMap()); err != nil {
+			e.log.Warn("failed to persist auth config: %v", err)
+		}
 		return &Result{IsExecutionResult: true, Message: "Username set"}, nil
 	case "PASSWORD":
 		e.auth.SetCredentials(e.auth.GetUsername(), value)
+		// Persist auth config
+		if err := e.storage.SetAuthConfig(e.auth.ToMap()); err != nil {
+			e.log.Warn("failed to persist auth config: %v", err)
+		}
 		return &Result{IsExecutionResult: true, Message: "Password updated"}, nil
 	case "LOG_LEVEL":
 		e.log.SetLevelFromString(value)

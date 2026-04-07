@@ -213,8 +213,19 @@ func fnLength(args []types.Value) (types.Value, error) {
 	if args[0].IsNull {
 		return types.NewNullValue(), nil
 	}
+
+	// For BLOB, return byte count
+	if args[0].Type == types.TypeBlob {
+		switch val := args[0].Data.(type) {
+		case []byte:
+			return types.NewIntValue(int64(len(val))), nil
+		case string:
+			return types.NewIntValue(int64(len(val))), nil
+		}
+	}
+
+	// For strings, return character count (runes)
 	s := args[0].ToString()
-	// Return character count (runes), not byte count
 	return types.NewIntValue(int64(utf8.RuneCountInString(s))), nil
 }
 
@@ -225,8 +236,19 @@ func fnByteLength(args []types.Value) (types.Value, error) {
 	if args[0].IsNull {
 		return types.NewNullValue(), nil
 	}
+
+	// For BLOB, return byte count
+	if args[0].Type == types.TypeBlob {
+		switch val := args[0].Data.(type) {
+		case []byte:
+			return types.NewIntValue(int64(len(val))), nil
+		case string:
+			return types.NewIntValue(int64(len(val))), nil
+		}
+	}
+
+	// For strings, return byte count (UTF-8 encoded)
 	s := args[0].ToString()
-	// Return byte count (UTF-8 encoded)
 	return types.NewIntValue(int64(len(s))), nil
 }
 

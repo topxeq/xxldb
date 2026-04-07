@@ -19,6 +19,9 @@ type DSN struct {
 	// In-memory mode
 	InMemory bool
 
+	// Encryption password
+	EncryptPassword string
+
 	// SSH configuration (if remote)
 	SSH *SSHConfig
 
@@ -64,6 +67,7 @@ type WebDAVConfig struct {
 //   - :memory: - in-memory database
 //   - /path/to/db - local file database
 //   - file:/path/to/db - local file database
+//   - /path/to/db?encrypt=password - local file database with encryption
 //   - ssh://user:pass@host:port/path/to/db - SSH with password
 //   - ssh://user@host:port/path/to/db?private_key=/path/to/key - SSH with key
 //   - smb://user:pass@host/share/path/to/db - SMB/CIFS share
@@ -94,6 +98,20 @@ func ParseDSN(dsn string) (*DSN, error) {
 	path := dsn
 	if strings.HasPrefix(path, "file:") {
 		path = strings.TrimPrefix(path, "file:")
+	}
+
+	// Check for query parameters (like encrypt=password)
+	if idx := strings.Index(path, "?"); idx != -1 {
+		queryStr := path[idx+1:]
+		path = path[:idx]
+
+		// Parse query parameters
+		values, err := url.ParseQuery(queryStr)
+		if err == nil {
+			if encrypt := values.Get("encrypt"); encrypt != "" {
+				return &DSN{Path: path, EncryptPassword: encrypt}, nil
+			}
+		}
 	}
 
 	return &DSN{Path: path}, nil

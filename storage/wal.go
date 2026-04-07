@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/topxeq/xxldb/storage/crypto"
 	"github.com/topxeq/xxldb/types"
 )
 
@@ -84,11 +85,12 @@ type WALHeader struct {
 
 // WAL manages Write-Ahead Logging
 type WAL struct {
-	mu       sync.Mutex
-	file     *os.File
-	path     string
-	lsn      uint64
-	enabled  bool
+	mu        sync.Mutex
+	file      *os.File
+	path      string
+	lsn       uint64
+	enabled   bool
+	encryptor *crypto.Encryptor
 }
 
 // NewWAL creates a new WAL instance
@@ -176,6 +178,11 @@ func (w *WAL) Write(record WALRecord) (uint64, error) {
 		return 0, fmt.Errorf("failed to marshal WAL record: %w", err)
 	}
 
+	// Encrypt if encryptor is set
+	if w.encryptor != nil {
+		data = crypto.EncryptData(data, "")
+	}
+
 	// Create header
 	header := WALHeader{
 		LSN:      record.LSN,
@@ -232,10 +239,20 @@ func (w *WAL) ReadAll() ([]WALRecord, error) {
 			return nil, err
 		}
 
-		// Verify checksum
+		// Verify checksum on the raw data (before decryption)
 		if crc32.ChecksumIEEE(data) != header.Checksum {
 			// Corrupted record, stop reading
 			break
+		}
+
+		// Decrypt if encryptor is set
+		if w.encryptor != nil {
+			decrypted, err := w.encryptor.Decrypt(data)
+			if err != nil {
+				// Decryption failed - wrong password or corrupted data
+				break
+			}
+			data = decrypted
 		}
 
 		// Unmarshal record
@@ -277,6 +294,13 @@ func (w *WAL) Close() error {
 		return nil
 	}
 	return w.file.Close()
+}
+
+// SetEncryptor sets the encryptor for WAL encryption
+func (w *WAL) SetEncryptor(encryptor *crypto.Encryptor) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.encryptor = encryptor
 }
 
 // CurrentLSN returns the current LSN
@@ -324,6 +348,15 @@ func (s *Storage) writeWAL(record WALRecord) error {
 		return fmt.Errorf("failed to marshal WAL record: %w", err)
 	}
 
+	// Encrypt if encryption is enabled
+	if s.encrypted && s.encryptor != nil {
+		encrypted, err := s.encryptor.Encrypt(data)
+		if err != nil {
+			return fmt.Errorf("failed to encrypt WAL record: %w", err)
+		}
+		data = encrypted
+	}
+
 	// Write header
 	header := WALHeader{
 		LSN:      record.LSN,
@@ -355,6 +388,11 @@ func (s *Storage) recoverFromWAL() error {
 		return err
 	}
 	defer wal.Close()
+
+	// Set encryptor if encryption is enabled
+	if s.encrypted && s.encryptor != nil {
+		wal.SetEncryptor(s.encryptor)
+	}
 
 	records, err := wal.ReadAll()
 	if err != nil {
@@ -396,6 +434,8 @@ func (s *Storage) recoverFromWAL() error {
 								}
 								if t, ok := colMap["type"].(string); ok {
 									colDef.Type = types.ParseDataType(t)
+								} else if t, ok := colMap["type"].(float64); ok {
+									colDef.Type = types.DataType(int(t))
 								}
 								if l, ok := colMap["length"].(float64); ok {
 									colDef.Length = int(l)
@@ -512,29 +552,50 @@ func interfaceToValue(v interface{}) types.Value {
 	// Check if it's a map (from JSON unmarshaling of types.Value)
 	if m, ok := v.(map[string]interface{}); ok {
 		// This might be a serialized types.Value
-		if data, hasData := m["data"]; hasData {
-			if isNull, hasIsNull := m["is_null"]; hasIsNull {
-				if isNull == true {
-					return types.NewNullValue()
-				}
-			}
+		if isNull, hasIsNull := m["is_null"]; hasIsNull && isNull == true {
+			return types.NewNullValue()
+		}
 
-			if typeStr, hasType := m["type"]; hasType {
-				// Use the type info to properly convert
-				switch typeStr {
-				case "INT", "SEQ":
+		if typeStr, hasType := m["type"]; hasType {
+			// Use the type info to properly convert
+			switch typeStr {
+			case "INT", "SEQ":
+				if data, ok := m["data"]; ok {
 					if f, ok := data.(float64); ok {
 						return types.NewIntValue(int64(f))
 					}
-				case "FLOAT":
+				}
+			case "FLOAT":
+				if data, ok := m["data"]; ok {
 					if f, ok := data.(float64); ok {
 						return types.NewFloatValue(f)
 					}
-				case "VARCHAR", "CHAR", "TEXT":
+				}
+			case "VARCHAR", "CHAR", "TEXT":
+				if data, ok := m["data"]; ok {
 					if s, ok := data.(string); ok {
 						return types.NewStringValue(s)
 					}
-				case "BLOB":
+				}
+			case "BLOB":
+				// Check for blob_ref first (external blob storage)
+				if blobRef, hasBlobRef := m["blob_ref"]; hasBlobRef {
+					if refMap, ok := blobRef.(map[string]interface{}); ok {
+						id := uint64(0)
+						size := int64(0)
+						if idf, ok := refMap["id"].(float64); ok {
+							id = uint64(idf)
+						}
+						if sizef, ok := refMap["size"].(float64); ok {
+							size = int64(sizef)
+						}
+						if id > 0 {
+							return types.NewBlobRefValue(id, size)
+						}
+					}
+				}
+				// Fallback: try to decode from data field
+				if data, ok := m["data"]; ok {
 					if s, ok := data.(string); ok {
 						return types.NewBlobValue([]byte(s))
 					}
@@ -549,8 +610,10 @@ func interfaceToValue(v interface{}) types.Value {
 					}
 				}
 			}
+		}
 
-			// Fallback: try to convert data directly
+		// Fallback: try to convert data directly
+		if data, ok := m["data"]; ok {
 			return types.NewValue(data)
 		}
 	}
@@ -579,6 +642,69 @@ func interfaceToValue(v interface{}) types.Value {
 	default:
 		return types.NewStringValue(fmt.Sprintf("%v", v))
 	}
+}
+
+// rawToValue converts a raw value to types.Value using table schema
+// Supports compact blob ref format: [1, id, size]
+func rawToValue(v interface{}, tableInfo *TableInfo, colIndex int) types.Value {
+	if v == nil {
+		return types.NewNullValue()
+	}
+
+	// Get column type if available
+	var colType types.DataType
+	if tableInfo != nil && colIndex < len(tableInfo.Columns) {
+		colType = tableInfo.Columns[colIndex].Type
+	}
+
+	// Check for compact blob ref format: [1, id, size]
+	if arr, ok := v.([]interface{}); ok && len(arr) == 3 {
+		if marker, ok := arr[0].(float64); ok && marker == 1 {
+			if id, ok := arr[1].(float64); ok {
+				if size, ok := arr[2].(float64); ok {
+					return types.NewBlobRefValue(uint64(id), int64(size))
+				}
+			}
+		}
+	}
+
+	// Convert based on column type
+	switch colType {
+	case types.TypeInt, types.TypeSeq:
+		switch val := v.(type) {
+		case float64:
+			return types.NewIntValue(int64(val))
+		case int64:
+			return types.NewIntValue(val)
+		case int:
+			return types.NewIntValue(int64(val))
+		case string:
+			// Try to parse as int
+			var i int64
+			if _, err := fmt.Sscanf(val, "%d", &i); err == nil {
+				return types.NewIntValue(i)
+			}
+		}
+	case types.TypeFloat:
+		switch val := v.(type) {
+		case float64:
+			return types.NewFloatValue(val)
+		case float32:
+			return types.NewFloatValue(float64(val))
+		case int:
+			return types.NewFloatValue(float64(val))
+		}
+	case types.TypeBlob, types.TypeImage:
+		switch val := v.(type) {
+		case []byte:
+			return types.NewBlobValue(val)
+		case string:
+			return types.NewBlobValue([]byte(val))
+		}
+	}
+
+	// Fallback: use interfaceToValue
+	return interfaceToValue(v)
 }
 
 // Checkpoint creates a checkpoint
