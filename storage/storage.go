@@ -93,6 +93,7 @@ type Storage struct {
 	// Encryption
 	encrypted bool
 	encryptor *crypto.Encryptor
+	metadataPendingPassword bool // True if metadata is encrypted but not yet loaded
 
 	// Skip save for bulk imports
 	skipSave bool
@@ -191,6 +192,7 @@ func (s *Storage) initFileStorage() error {
 		if crypto.IsEncryptedFile(data) {
 			// Metadata is encrypted, don't load yet - wait for password
 			s.encrypted = true
+			s.metadataPendingPassword = true
 			// Don't recover from WAL yet - will do after password is set
 		} else {
 			// Not encrypted, load normally
@@ -253,6 +255,9 @@ func (s *Storage) loadMetadata() error {
 	if err := json.Unmarshal(data, &meta); err != nil {
 		return fmt.Errorf("failed to parse metadata: %w", err)
 	}
+
+	// Metadata successfully loaded
+	s.metadataPendingPassword = false
 
 	s.tables = meta.Tables
 	s.sequences = meta.Sequences
@@ -972,7 +977,8 @@ func (s *Storage) Close() error {
 	}
 
 	// Save metadata and truncate WAL
-	if s.enabled {
+	// Only save if metadata was successfully loaded (not just detected as encrypted)
+	if s.enabled && !s.metadataPendingPassword {
 		if err := s.saveMetadata(); err != nil {
 			return err
 		}
