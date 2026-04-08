@@ -126,6 +126,7 @@ type Statement struct {
 	IndexCols    []string
 	IndexUnique  bool
 	IndexFullText bool // FULLTEXT index
+	FTSOptions   map[string]string // FTS index options (LEVELS, etc.)
 
 	// SET
 	SetVar   string
@@ -288,6 +289,7 @@ type Expression struct {
 	MatchColumn string      // Column name for MATCH
 	MatchQuery  string      // Search query
 	MatchMode   string      // Search mode: "" (default), "BOOLEAN", "QUERY EXPANSION"
+	MatchLevel  int         // Search level: 0 (all), 1, 2, 3
 }
 
 // ExprType represents the type of expression

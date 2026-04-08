@@ -858,6 +858,19 @@ func (p *Parser) parseMatchAgainst() (*Expression, error) {
 		}
 	}
 
+	// Optional LEVEL n
+	level := 0 // 0 means all levels
+	if p.matchKeyword("LEVEL") {
+		p.advance()
+		if !p.match(TokNumber) {
+			return nil, fmt.Errorf("expected level number after LEVEL: %s", p.current())
+		}
+		levelStr := p.advance().Value
+		if n, err := strconv.Atoi(levelStr); err == nil && n >= 1 && n <= 3 {
+			level = n
+		}
+	}
+
 	// Close paren
 	if err := p.expect(TokRParen, ""); err != nil {
 		return nil, err
@@ -868,6 +881,7 @@ func (p *Parser) parseMatchAgainst() (*Expression, error) {
 		MatchColumn: column,
 		MatchQuery:  query,
 		MatchMode:   mode,
+		MatchLevel:  level,
 	}, nil
 }
 

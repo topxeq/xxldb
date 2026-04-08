@@ -243,13 +243,14 @@ func (s *Storage) loadMetadata() error {
 	}
 
 	var meta struct {
-		Version   uint64                 `json:"version"`
-		Tables    map[string]*TableInfo  `json:"tables"`
-		Sequences map[string]int64       `json:"sequences"`
-		NextID    uint64                 `json:"next_id"`
-		Auth      map[string]interface{} `json:"auth,omitempty"`
-		Encrypted bool                   `json:"encrypted,omitempty"`
-		Rows      map[string]interface{} `json:"rows,omitempty"`
+		Version    uint64                    `json:"version"`
+		Tables     map[string]*TableInfo     `json:"tables"`
+		Sequences  map[string]int64          `json:"sequences"`
+		NextID     uint64                    `json:"next_id"`
+		Auth       map[string]interface{}    `json:"auth,omitempty"`
+		Encrypted  bool                      `json:"encrypted,omitempty"`
+		Rows       map[string]interface{}    `json:"rows,omitempty"`
+		FTSIndexes map[string]*FTSIndexInfo  `json:"fts_indexes,omitempty"`
 	}
 
 	if err := json.Unmarshal(data, &meta); err != nil {
@@ -273,6 +274,14 @@ func (s *Storage) loadMetadata() error {
 	}
 	if meta.Encrypted {
 		s.encrypted = true
+	}
+
+	// Restore FTS indexes
+	if meta.FTSIndexes != nil {
+		s.ftsIndexes = meta.FTSIndexes
+	}
+	if s.ftsIndexes == nil {
+		s.ftsIndexes = make(map[string]*FTSIndexInfo)
 	}
 
 	// Initialize row storage for each table
@@ -390,14 +399,16 @@ func (s *Storage) saveMetadata() error {
 		Auth      map[string]interface{} `json:"auth,omitempty"`
 		Encrypted bool                   `json:"encrypted,omitempty"`
 		Rows      map[string]interface{} `json:"rows,omitempty"`
+		FTSIndexes map[string]*FTSIndexInfo `json:"fts_indexes,omitempty"`
 	}{
-		Version:   CurrentVersion,
-		Tables:    s.tables,
-		Sequences: s.sequences,
-		NextID:    s.nextID,
-		Auth:      s.authConfig,
-		Encrypted: s.encrypted,
-		Rows:      rowsData,
+		Version:    CurrentVersion,
+		Tables:     s.tables,
+		Sequences:  s.sequences,
+		NextID:     s.nextID,
+		Auth:       s.authConfig,
+		Encrypted:  s.encrypted,
+		Rows:       rowsData,
+		FTSIndexes: s.ftsIndexes,
 	}
 
 	// Use compact JSON (no indent) to reduce size
@@ -1167,6 +1178,51 @@ func (s *Storage) GetRowsWithIDs(tableName string) ([]RowWithID, error) {
 		return nil, fmt.Errorf("table %s does not exist", tableName)
 	}
 
+	// Check if using V2 format (page-based storage)
+	if tf, exists := s.tableFiles[tableName]; exists {
+		rowsWithIDs, err := tf.GetAllRowsWithIDs()
+		if err != nil {
+			return nil, err
+		}
+		result := make([]RowWithID, len(rowsWithIDs))
+		for i, rowWithID := range rowsWithIDs {
+			result[i] = RowWithID{
+				ID:  rowWithID.ID,
+				Row: make([]types.Value, len(rowWithID.Row)),
+			}
+			for j, val := range rowWithID.Row {
+				result[i].Row[j] = s.resolveBlobRef(val)
+			}
+		}
+		return result, nil
+	}
+
+	// Check if data file exists for V2 format
+	dataPath := filepath.Join(s.path, DataDirName, tableName+TableFileExt)
+	if _, err := os.Stat(dataPath); err == nil {
+		// Open table file and use V2 format
+		tf, err := OpenTableFile(s, tableName)
+		if err == nil {
+			s.tableFiles[tableName] = tf
+			rowsWithIDs, err := tf.GetAllRowsWithIDs()
+			if err != nil {
+				return nil, err
+			}
+			result := make([]RowWithID, len(rowsWithIDs))
+			for i, rowWithID := range rowsWithIDs {
+				result[i] = RowWithID{
+					ID:  rowWithID.ID,
+					Row: make([]types.Value, len(rowWithID.Row)),
+				}
+				for j, val := range rowWithID.Row {
+					result[i].Row[j] = s.resolveBlobRef(val)
+				}
+			}
+			return result, nil
+		}
+	}
+
+	// V1 format: use in-memory storage
 	rows, exists := s.rowData[tableName]
 	if !exists {
 		return []RowWithID{}, nil
@@ -1940,6 +1996,26 @@ func (s *Storage) HasFTSIndex(tableName, columnName string) bool {
 
 	_, exists := s.ftsIndexes[tableName+"."+columnName]
 	return exists
+}
+
+// GetFTSIndexPath returns the file path for persisting FTS index
+func (s *Storage) GetFTSIndexPath(tableName, columnName string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	key := tableName + "." + columnName
+	info, exists := s.ftsIndexes[key]
+	if !exists {
+		return ""
+	}
+
+	// Use the index name or key as filename
+	fileName := "fts_" + info.IndexName + ".idx"
+	if info.IndexName == "" {
+		fileName = "fts_" + key + ".idx"
+	}
+
+	return filepath.Join(s.path, DataDirName, fileName)
 }
 
 // Reader returns an io.Reader for a blob

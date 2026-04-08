@@ -548,6 +548,21 @@ func (p *Parser) parseCreateIndex() (*Statement, error) {
 		return nil, err
 	}
 
+	// USING clause (for FTS)
+	if p.matchKeyword("USING") {
+		p.advance()
+		// FTS might be parsed as keyword or identifier
+		if p.matchKeyword("FTS") || p.matchKeyword("FULLTEXT") {
+			stmt.IndexFullText = true
+			p.advance()
+		} else if p.match(TokIdent) && (strings.ToUpper(p.current().Value) == "FTS" || strings.ToUpper(p.current().Value) == "FULLTEXT") {
+			stmt.IndexFullText = true
+			p.advance()
+		} else {
+			return nil, fmt.Errorf("expected FTS or FULLTEXT after USING, got %s", p.current())
+		}
+	}
+
 	return stmt, nil
 }
 
@@ -620,7 +635,90 @@ func (p *Parser) parseCreateFullTextIndex() (*Statement, error) {
 		return nil, err
 	}
 
+	// Parse WITH options (optional)
+	if p.matchKeyword("WITH") {
+		options, err := p.parseFTSOptions()
+		if err != nil {
+			return nil, err
+		}
+		stmt.FTSOptions = options
+	}
+
 	return stmt, nil
+}
+
+// parseFTSOptions parses FTS index options
+func (p *Parser) parseFTSOptions() (map[string]string, error) {
+	options := make(map[string]string)
+
+	p.advance() // Skip WITH
+
+	// Expect ( or just key=value
+	if p.match(TokLParen) {
+		p.advance() // Skip (
+
+		for !p.match(TokRParen) && p.current().Type != TokEOF {
+			// key = value
+			if !p.match(TokIdent) {
+				return nil, fmt.Errorf("expected option name, got %s", p.current())
+			}
+			key := strings.ToUpper(p.advance().Value)
+
+			if !p.match(TokOperator) || p.current().Value != "=" {
+				return nil, fmt.Errorf("expected = after option name, got %s", p.current())
+			}
+			p.advance() // Skip =
+
+			// Value can be string or number
+			var value string
+			if p.match(TokString) {
+				value = p.advance().Value
+			} else if p.match(TokNumber) {
+				value = p.advance().Value
+			} else if p.match(TokIdent) {
+				value = p.advance().Value
+			} else {
+				return nil, fmt.Errorf("expected option value, got %s", p.current())
+			}
+
+			options[key] = value
+
+			// Optional comma
+			if p.match(TokComma) {
+				p.advance()
+			}
+		}
+
+		if err := p.expect(TokRParen, ""); err != nil {
+			return nil, err
+		}
+	} else {
+		// Simple form: WITH LEVELS = '1,2'
+		if !p.match(TokIdent) {
+			return nil, fmt.Errorf("expected option name, got %s", p.current())
+		}
+		key := strings.ToUpper(p.advance().Value)
+
+		if !p.match(TokOperator) || p.current().Value != "=" {
+			return nil, fmt.Errorf("expected = after option name, got %s", p.current())
+		}
+		p.advance() // Skip =
+
+		var value string
+		if p.match(TokString) {
+			value = p.advance().Value
+		} else if p.match(TokNumber) {
+			value = p.advance().Value
+		} else if p.match(TokIdent) {
+			value = p.advance().Value
+		} else {
+			return nil, fmt.Errorf("expected option value, got %s", p.current())
+		}
+
+		options[key] = value
+	}
+
+	return options, nil
 }
 
 // parseDrop parses DROP statement

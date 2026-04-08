@@ -1,6 +1,6 @@
 # Binaries
-xxldb
-xxldb.exe
+/xxldb
+/xxldb.exe
 *.exe
 *.dll
 *.so

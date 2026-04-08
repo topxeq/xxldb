@@ -2,12 +2,15 @@
 package executor
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
+	"github.com/topxeq/xxldb/fts"
 	"github.com/topxeq/xxldb/parser"
 	"github.com/topxeq/xxldb/types"
 )
@@ -121,13 +124,13 @@ func (e *Engine) buildRow(tableInfo *types.TableInfo, columns []string, values [
 		for i, colName := range columns {
 			idx := colIndex[strings.ToLower(colName)]
 			if i < len(values) {
-				row[idx] = e.evalExpr(values[i], nil, nil)
+				row[idx] = e.evalExpr(values[i], nil, nil, 0)
 			}
 		}
 	} else {
 		// Values in column order
 		for i := 0; i < len(values) && i < len(row); i++ {
-			row[i] = e.evalExpr(values[i], nil, nil)
+			row[i] = e.evalExpr(values[i], nil, nil, 0)
 		}
 	}
 
@@ -159,7 +162,7 @@ func (e *Engine) executeUpdate(stmt *parser.Statement) (*Result, error) {
 		if stmt.Where == nil {
 			return true
 		}
-		return e.evalBool(stmt.Where, row, colIndex)
+		return e.evalBool(stmt.Where, row, colIndex, 0)
 	}
 
 	// Build update function that evaluates expressions with current row context
@@ -167,7 +170,7 @@ func (e *Engine) executeUpdate(stmt *parser.Statement) (*Result, error) {
 		updates := make(map[int]types.Value)
 		for idx, expr := range updateExprs {
 			// Evaluate expression with current row values
-			updates[idx] = e.evalExpr(expr, row, colIndex)
+			updates[idx] = e.evalExpr(expr, row, colIndex, 0)
 		}
 		return updates
 	}
@@ -216,7 +219,7 @@ func (e *Engine) executeDelete(stmt *parser.Statement) (*Result, error) {
 		if stmt.Where == nil {
 			return true
 		}
-		return e.evalBool(stmt.Where, row, colIndex)
+		return e.evalBool(stmt.Where, row, colIndex, 0)
 	}
 
 	// Callback to remove from FTS indexes
@@ -267,7 +270,7 @@ func (e *Engine) executeCreateTable(stmt *parser.Statement) (*Result, error) {
 		}
 
 		if colDef.Default != nil {
-			defVal := e.evalExpr(colDef.Default, nil, nil)
+			defVal := e.evalExpr(colDef.Default, nil, nil, 0)
 			columns[i].Default = &defVal
 		}
 
@@ -439,21 +442,48 @@ func (e *Engine) executeCreateIndex(stmt *parser.Statement) (*Result, error) {
 			return nil, fmt.Errorf("FULLTEXT index requires at least one column")
 		}
 
+		// Parse FTS options
+		var ftsConfig *fts.FTSConfig
+		if stmt.FTSOptions != nil {
+			ftsConfig = e.parseFTSOptions(stmt.FTSOptions)
+		}
+
 		// Create FTS index for each column
 		for _, col := range stmt.IndexCols {
-			if err := e.fts.CreateIndex(stmt.Table, col, nil); err != nil {
+			// Check if FTS index already exists
+			if e.fts.HasIndex(stmt.Table, col) {
+				// Index already exists in memory, skip creation but ensure metadata is saved
+				e.storage.CreateFTSIndex(stmt.Table, col, stmt.IndexName)
+				continue
+			}
+
+			// Create in-memory FTS index with config
+			if err := e.fts.CreateIndexWithConfig(stmt.Table, col, nil, ftsConfig); err != nil {
 				return nil, fmt.Errorf("failed to create fulltext index: %w", err)
+			}
+
+			// Persist FTS index metadata to storage
+			if err := e.storage.CreateFTSIndex(stmt.Table, col, stmt.IndexName); err != nil {
+				e.log.Warn("failed to persist FTS index metadata: %v", err)
 			}
 
 			// Index existing rows
 			if err := e.indexExistingRows(stmt.Table, col); err != nil {
 				e.log.Warn("failed to index existing rows for column %s: %v", col, err)
 			}
+
+			// Save FTS index to disk
+			e.saveFTSIndex(stmt.Table, col)
+		}
+
+		levelStr := ""
+		if ftsConfig != nil && len(ftsConfig.Levels) > 0 {
+			levelStr = fmt.Sprintf(" (levels: %v)", ftsConfig.Levels)
 		}
 
 		return &Result{
 			IsExecutionResult: true,
-			Message:           fmt.Sprintf("Fulltext index %s created on table %s (%s)", stmt.IndexName, stmt.Table, strings.Join(stmt.IndexCols, ", ")),
+			Message:           fmt.Sprintf("Fulltext index %s created on table %s (%s)%s", stmt.IndexName, stmt.Table, strings.Join(stmt.IndexCols, ", "), levelStr),
 		}, nil
 	}
 
@@ -462,6 +492,108 @@ func (e *Engine) executeCreateIndex(stmt *parser.Statement) (*Result, error) {
 		IsExecutionResult: true,
 		Message:           fmt.Sprintf("Index %s created on table %s", stmt.IndexName, stmt.Table),
 	}, nil
+}
+
+// parseFTSOptions parses FTS options from statement options map
+func (e *Engine) parseFTSOptions(options map[string]string) *fts.FTSConfig {
+	config := fts.DefaultFTSConfig()
+
+	// Parse LEVELS option
+	if levelsStr, ok := options["LEVELS"]; ok {
+		// Remove quotes if present
+		levelsStr = strings.Trim(levelsStr, "'\"")
+		parts := strings.Split(levelsStr, ",")
+		levels := make([]int, 0, len(parts))
+		for _, p := range parts {
+			p = strings.TrimSpace(p)
+			if n, err := strconv.Atoi(p); err == nil && n >= 1 && n <= 3 {
+				levels = append(levels, n)
+			}
+		}
+		if len(levels) > 0 {
+			config.Levels = levels
+		}
+	}
+
+	// Parse MIN_TERM_LEN option
+	if minLenStr, ok := options["MIN_TERM_LEN"]; ok {
+		if minLen, err := strconv.Atoi(minLenStr); err == nil && minLen >= 1 {
+			config.MinTermLen = minLen
+		}
+	}
+
+	// Parse STORE_POSITION option
+	if storePosStr, ok := options["STORE_POSITION"]; ok {
+		storePosStr = strings.Trim(strings.ToLower(storePosStr), "'\"")
+		config.StorePos = storePosStr == "true" || storePosStr == "1"
+	}
+
+	// Parse WEIGHT options
+	if w1, ok := options["WEIGHT_L1"]; ok {
+		if weight, err := strconv.ParseFloat(w1, 64); err == nil && weight > 0 {
+			config.WeightL1 = weight
+		}
+	}
+	if w2, ok := options["WEIGHT_L2"]; ok {
+		if weight, err := strconv.ParseFloat(w2, 64); err == nil && weight > 0 {
+			config.WeightL2 = weight
+		}
+	}
+	if w3, ok := options["WEIGHT_L3"]; ok {
+		if weight, err := strconv.ParseFloat(w3, 64); err == nil && weight > 0 {
+			config.WeightL3 = weight
+		}
+	}
+
+	// Parse CUSTOM_DICT option (JSON format: '["word1","word2"]')
+	if dictStr, ok := options["CUSTOM_DICT"]; ok {
+		dictStr = strings.Trim(dictStr, "'\"")
+		var words []string
+		if err := json.Unmarshal([]byte(dictStr), &words); err == nil {
+			config.CustomDict = make(map[string]bool)
+			for _, word := range words {
+				config.CustomDict[strings.ToLower(word)] = true
+			}
+		}
+	}
+
+	// Parse SYNONYMS option (JSON format: '{"word":["syn1","syn2"]}')
+	if synStr, ok := options["SYNONYMS"]; ok {
+		synStr = strings.Trim(synStr, "'\"")
+		var synMap map[string][]string
+		if err := json.Unmarshal([]byte(synStr), &synMap); err == nil {
+			config.Synonyms = make(map[string][]string)
+			for word, syns := range synMap {
+				config.Synonyms[strings.ToLower(word)] = syns
+			}
+		}
+	}
+
+	return config
+}
+
+// saveFTSIndex saves the FTS index to disk
+func (e *Engine) saveFTSIndex(tableName, columnName string) {
+	ftsFilePath := e.storage.GetFTSIndexPath(tableName, columnName)
+	if ftsFilePath == "" {
+		return
+	}
+
+	indexer := e.fts.GetIndex(tableName, columnName)
+	if indexer == nil {
+		return
+	}
+
+	invIdx, ok := indexer.(*fts.InvertedIndex)
+	if !ok {
+		return
+	}
+
+	if err := invIdx.SaveToFile(ftsFilePath); err != nil {
+		e.log.Warn("failed to save FTS index to %s: %v", ftsFilePath, err)
+	} else {
+		e.log.Debug("Saved FTS index to %s", ftsFilePath)
+	}
 }
 
 // indexExistingRows indexes existing rows in a table for FTS
@@ -483,23 +615,30 @@ func (e *Engine) indexExistingRows(tableName, columnName string) error {
 		return fmt.Errorf("column %s not found", columnName)
 	}
 
-	// Get all rows
-	rows, err := e.storage.GetRows(tableName)
+	// Get all rows with their IDs
+	rows, err := e.storage.GetRowsWithIDs(tableName)
 	if err != nil {
 		return err
 	}
 
+	e.log.Info("Indexing %d rows for FTS on %s.%s", len(rows), tableName, columnName)
+
 	// Index each row
-	for rowID, row := range rows {
-		if colIdx < len(row) {
-			content := row[colIdx].ToString()
+	indexedCount := 0
+	for _, rowWithID := range rows {
+		if colIdx < len(rowWithID.Row) {
+			content := rowWithID.Row[colIdx].ToString()
 			if content != "" {
-				if err := e.fts.IndexDocument(tableName, columnName, uint64(rowID+1), content); err != nil {
-					e.log.Debug("failed to index row %d: %v", rowID+1, err)
+				if err := e.fts.IndexDocument(tableName, columnName, rowWithID.ID, content); err != nil {
+					e.log.Debug("failed to index row %d: %v", rowWithID.ID, err)
+				} else {
+					indexedCount++
 				}
 			}
 		}
 	}
+
+	e.log.Info("Successfully indexed %d rows for FTS", indexedCount)
 
 	return nil
 }
@@ -582,7 +721,7 @@ func (e *Engine) executeAlterTable(stmt *parser.Statement) (*Result, error) {
 func (e *Engine) executeSet(stmt *parser.Statement) (*Result, error) {
 	value := ""
 	if stmt.SetValue != nil {
-		value = e.evalExpr(stmt.SetValue, nil, nil).ToString()
+		value = e.evalExpr(stmt.SetValue, nil, nil, 0).ToString()
 	}
 
 	setVar := strings.ToUpper(stmt.SetVar)

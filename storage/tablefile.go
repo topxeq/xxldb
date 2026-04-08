@@ -731,6 +731,26 @@ func (tf *TableFile) GetAllRows() ([][]types.Value, error) {
 	return rows, nil
 }
 
+// GetAllRowsWithIDs returns all rows with their IDs
+func (tf *TableFile) GetAllRowsWithIDs() ([]RowWithID, error) {
+	var rows []RowWithID
+	iter := tf.ScanRows()
+
+	for iter.Next() {
+		id, row, err := iter.Row()
+		if err != nil {
+			return nil, err
+		}
+		rows = append(rows, RowWithID{ID: id, Row: row})
+	}
+
+	if err := iter.Err(); err != nil {
+		return nil, err
+	}
+
+	return rows, nil
+}
+
 // GetRowCount returns the number of rows in the table
 func (tf *TableFile) GetRowCount() uint64 {
 	tf.mu.RLock()

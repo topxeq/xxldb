@@ -126,7 +126,7 @@ var keywords = map[string]bool{
 	"LOG": true, "LEVEL": true,
 	"BEGIN": true, "COMMIT": true, "ROLLBACK": true, "TRANSACTION": true, "START": true,
 	// Full-text search
-	"FULLTEXT": true, "MATCH": true, "AGAINST": true,
+	"FULLTEXT": true, "MATCH": true, "AGAINST": true, "WITH": true,
 }
 
 // Lexer tokenizes SQL input

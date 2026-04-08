@@ -141,6 +141,11 @@ func NewEngineWithConfig(config Config) (*Engine, error) {
 		engine.auth.SetCredentials(config.Username, config.Password)
 	}
 
+	// Restore FTS indexes from storage metadata
+	if err := engine.restoreFTSIndexes(); err != nil {
+		engine.log.Warn("failed to restore FTS indexes: %v", err)
+	}
+
 	return engine, nil
 }
 
@@ -186,6 +191,11 @@ func NewEngineWithFS(path string, inMemory bool, fs storage.FileSystem) (*Engine
 		engine.auth.FromMap(authConfig)
 	}
 
+	// Restore FTS indexes from storage metadata
+	if err := engine.restoreFTSIndexes(); err != nil {
+		engine.log.Warn("failed to restore FTS indexes: %v", err)
+	}
+
 	return engine, nil
 }
 
@@ -207,6 +217,48 @@ func (e *Engine) initSystemTables() error {
 	})
 
 	return e.storage.CreateTable(tableInfo)
+}
+
+// restoreFTSIndexes restores FTS indexes from storage metadata
+func (e *Engine) restoreFTSIndexes() error {
+	ftsIndexes := e.storage.GetFTSIndexes()
+	if len(ftsIndexes) == 0 {
+		return nil
+	}
+
+	for key, info := range ftsIndexes {
+		// Check if FTS index already exists in memory (from previous restore)
+		if e.fts.HasIndex(info.TableName, info.ColumnName) {
+			continue
+		}
+
+		// Create the FTS index in memory
+		if err := e.fts.CreateIndex(info.TableName, info.ColumnName, nil); err != nil {
+			e.log.Warn("failed to create FTS index %s: %v", key, err)
+			continue
+		}
+
+		// Try to load persisted FTS index from disk
+		ftsFilePath := e.storage.GetFTSIndexPath(info.TableName, info.ColumnName)
+		if ftsFilePath != "" {
+			if indexer := e.fts.GetIndex(info.TableName, info.ColumnName); indexer != nil {
+				if invIdx, ok := indexer.(*fts.InvertedIndex); ok {
+					if err := invIdx.LoadFromFile(ftsFilePath); err == nil {
+						e.log.Info("Loaded FTS index from %s", ftsFilePath)
+						continue // Successfully loaded, skip re-indexing
+					}
+				}
+			}
+		}
+
+		// FTS index file not found or load failed, re-index existing rows
+		e.log.Info("Re-indexing %s.%s...", info.TableName, info.ColumnName)
+		if err := e.indexExistingRows(info.TableName, info.ColumnName); err != nil {
+			e.log.Warn("failed to re-index %s.%s: %v", info.TableName, info.ColumnName, err)
+		}
+	}
+
+	return nil
 }
 
 // Close closes the engine
@@ -234,6 +286,11 @@ func (e *Engine) ForceSave() error {
 // IsEncrypted returns whether the database is encrypted
 func (e *Engine) IsEncrypted() bool {
 	return e.storage.IsEncrypted()
+}
+
+// GetFTSIndexes returns the list of FTS indexes (for debugging)
+func (e *Engine) GetFTSIndexes() []string {
+	return e.fts.ListIndexes()
 }
 
 // SetEncryption enables encryption with the given password
@@ -429,8 +486,8 @@ func (e *Engine) executeSelect(stmt *parser.Statement) (*Result, error) {
 		return nil, err
 	}
 
-	// Get all rows (simplified - will be optimized with indexes)
-	rows, err := e.storage.GetRows(stmt.Table)
+	// Get all rows with their IDs (needed for FTS)
+	rowsWithIDs, err := e.storage.GetRowsWithIDs(stmt.Table)
 	if err != nil {
 		return nil, err
 	}
@@ -441,10 +498,10 @@ func (e *Engine) executeSelect(stmt *parser.Statement) (*Result, error) {
 		colIndex[strings.ToLower(col.Name)] = i
 	}
 
-	// Convert to result rows
-	resultRows := make([]*Row, len(rows))
-	for i, data := range rows {
-		resultRows[i] = &Row{Data: data}
+	// Convert to result rows with IDs
+	resultRows := make([]*Row, len(rowsWithIDs))
+	for i, rowWithID := range rowsWithIDs {
+		resultRows[i] = &Row{ID: rowWithID.ID, Data: rowWithID.Row}
 	}
 
 	// Apply WHERE filter
@@ -515,10 +572,10 @@ func (e *Engine) executeSelect(stmt *parser.Statement) (*Result, error) {
 			data := make([]types.Value, len(stmt.Columns))
 			for j, col := range stmt.Columns {
 				if col.Expr != nil {
-					data[j] = e.evalExpr(col.Expr, row.Data, colIndex)
+					data[j] = e.evalExpr(col.Expr, row.Data, colIndex, row.ID)
 				}
 			}
-			projectedRows[i] = &Row{Data: data}
+			projectedRows[i] = &Row{ID: row.ID, Data: data}
 		}
 		resultRows = projectedRows
 	}
@@ -558,7 +615,7 @@ func (e *Engine) executeSelectWithoutTable(stmt *parser.Statement) (*Result, err
 
 		// Evaluate expression
 		if col.Expr != nil {
-			data[i] = e.evalExpr(col.Expr, nil, nil)
+			data[i] = e.evalExpr(col.Expr, nil, nil, 0)
 		}
 	}
 
@@ -881,7 +938,7 @@ func (e *Engine) executeInformationSchemaQuery(stmt *parser.Statement) (*Result,
 func (e *Engine) filterRows(rows []*Row, where *parser.Expression, colIndex map[string]int) []*Row {
 	var result []*Row
 	for _, row := range rows {
-		if e.evalBool(where, row.Data, colIndex) {
+		if e.evalBool(where, row.Data, colIndex, row.ID) {
 			result = append(result, row)
 		}
 	}
@@ -945,7 +1002,7 @@ func (e *Engine) groupWithAggregates(rows []*Row, groupBy []string, columns []pa
 				// Collect values from all rows in this group
 				for _, row := range groupRows {
 					if len(col.Expr.Args) > 0 && col.Expr.Args[0].Type != parser.ExprStar {
-						val := e.evalExpr(col.Expr.Args[0], row.Data, colIndex)
+						val := e.evalExpr(col.Expr.Args[0], row.Data, colIndex, row.ID)
 						values = append(values, val)
 					} else {
 						// COUNT(*) case
@@ -968,7 +1025,7 @@ func (e *Engine) groupWithAggregates(rows []*Row, groupBy []string, columns []pa
 				}
 			} else {
 				// Other expression - evaluate with first row
-				data[i] = e.evalExpr(col.Expr, groupRows[0].Data, colIndex)
+				data[i] = e.evalExpr(col.Expr, groupRows[0].Data, colIndex, groupRows[0].ID)
 			}
 		}
 
@@ -1026,8 +1083,8 @@ func (e *Engine) shouldSwap(row1, row2 *Row, orderBy []parser.OrderByClause, col
 				val2 = row2.Data[idx]
 			}
 		} else {
-			val1 = e.evalExpr(ob.Expr, row1.Data, colIndex)
-			val2 = e.evalExpr(ob.Expr, row2.Data, colIndex)
+			val1 = e.evalExpr(ob.Expr, row1.Data, colIndex, row1.ID)
+			val2 = e.evalExpr(ob.Expr, row2.Data, colIndex, row2.ID)
 		}
 
 		cmp := val1.Compare(val2)
@@ -1103,7 +1160,7 @@ func (e *Engine) computeAggregates(rows []*Row, columns []parser.SelectColumn, c
 							// Check if it's COUNT(*) case (single arg with ExprStar type)
 							if len(col.Expr.Args) > 0 && col.Expr.Args[0].Type != parser.ExprStar {
 								// Get the column/value from args
-								val := e.evalExpr(col.Expr.Args[0], row.Data, colIndex)
+								val := e.evalExpr(col.Expr.Args[0], row.Data, colIndex, row.ID)
 								values = append(values, val)
 							} else {
 								// COUNT(*) case or no args - count each row as 1
@@ -1119,11 +1176,11 @@ func (e *Engine) computeAggregates(rows []*Row, columns []parser.SelectColumn, c
 				}
 			} else {
 				// Non-aggregate function, evaluate with first row
-				data[i] = e.evalExpr(col.Expr, rows[0].Data, colIndex)
+				data[i] = e.evalExpr(col.Expr, rows[0].Data, colIndex, rows[0].ID)
 			}
 		} else if col.Expr != nil {
 			// Non-function expression
-			data[i] = e.evalExpr(col.Expr, rows[0].Data, colIndex)
+			data[i] = e.evalExpr(col.Expr, rows[0].Data, colIndex, rows[0].ID)
 		}
 	}
 
@@ -1131,7 +1188,7 @@ func (e *Engine) computeAggregates(rows []*Row, columns []parser.SelectColumn, c
 }
 
 // evalExpr evaluates an expression
-func (e *Engine) evalExpr(expr *parser.Expression, row []types.Value, colIndex map[string]int) types.Value {
+func (e *Engine) evalExpr(expr *parser.Expression, row []types.Value, colIndex map[string]int, rowID uint64) types.Value {
 	if expr == nil {
 		return types.NewNullValue()
 	}
@@ -1152,25 +1209,25 @@ func (e *Engine) evalExpr(expr *parser.Expression, row []types.Value, colIndex m
 		return types.NewNullValue()
 
 	case parser.ExprFunction:
-		return e.evalFunction(expr.FuncName, expr.Args, row, colIndex)
+		return e.evalFunction(expr.FuncName, expr.Args, row, colIndex, rowID)
 
 	case parser.ExprBinaryOp:
-		return e.evalBinaryOp(expr, row, colIndex)
+		return e.evalBinaryOp(expr, row, colIndex, rowID)
 
 	case parser.ExprUnaryOp:
-		return e.evalUnaryOp(expr, row, colIndex)
+		return e.evalUnaryOp(expr, row, colIndex, rowID)
 
 	case parser.ExprCase:
-		return e.evalCase(expr, row, colIndex)
+		return e.evalCase(expr, row, colIndex, rowID)
 
 	case parser.ExprIn:
-		return e.evalIn(expr, row, colIndex)
+		return e.evalIn(expr, row, colIndex, rowID)
 
 	case parser.ExprBetween:
-		return e.evalBetween(expr, row, colIndex)
+		return e.evalBetween(expr, row, colIndex, rowID)
 
 	case parser.ExprMatch:
-		return e.evalMatchAgainst(expr, row, colIndex)
+		return e.evalMatchAgainst(expr, row, colIndex, rowID)
 
 	default:
 		return types.NewNullValue()
@@ -1178,24 +1235,24 @@ func (e *Engine) evalExpr(expr *parser.Expression, row []types.Value, colIndex m
 }
 
 // evalBool evaluates an expression as boolean
-func (e *Engine) evalBool(expr *parser.Expression, row []types.Value, colIndex map[string]int) bool {
-	val := e.evalExpr(expr, row, colIndex)
+func (e *Engine) evalBool(expr *parser.Expression, row []types.Value, colIndex map[string]int, rowID uint64) bool {
+	val := e.evalExpr(expr, row, colIndex, rowID)
 	return val.ToBool()
 }
 
 // evalInt evaluates an expression as integer
 func (e *Engine) evalInt(expr *parser.Expression) int64 {
-	val := e.evalExpr(expr, nil, nil)
+	val := e.evalExpr(expr, nil, nil, 0)
 	n, _ := val.ToInt64()
 	return n
 }
 
 // evalFunction evaluates a function call
-func (e *Engine) evalFunction(name string, args []*parser.Expression, row []types.Value, colIndex map[string]int) types.Value {
+func (e *Engine) evalFunction(name string, args []*parser.Expression, row []types.Value, colIndex map[string]int, rowID uint64) types.Value {
 	// Evaluate arguments
 	values := make([]types.Value, len(args))
 	for i, arg := range args {
-		values[i] = e.evalExpr(arg, row, colIndex)
+		values[i] = e.evalExpr(arg, row, colIndex, rowID)
 	}
 
 	// Check if it's a script function
@@ -1296,9 +1353,9 @@ func (e *Engine) evalScriptFunc(name string, args []types.Value) types.Value {
 }
 
 // evalBinaryOp evaluates a binary operation
-func (e *Engine) evalBinaryOp(expr *parser.Expression, row []types.Value, colIndex map[string]int) types.Value {
-	left := e.evalExpr(expr.Left, row, colIndex)
-	right := e.evalExpr(expr.Right, row, colIndex)
+func (e *Engine) evalBinaryOp(expr *parser.Expression, row []types.Value, colIndex map[string]int, rowID uint64) types.Value {
+	left := e.evalExpr(expr.Left, row, colIndex, rowID)
+	right := e.evalExpr(expr.Right, row, colIndex, rowID)
 
 	switch expr.Op {
 	case "=":
@@ -1335,8 +1392,8 @@ func (e *Engine) evalBinaryOp(expr *parser.Expression, row []types.Value, colInd
 }
 
 // evalUnaryOp evaluates a unary operation
-func (e *Engine) evalUnaryOp(expr *parser.Expression, row []types.Value, colIndex map[string]int) types.Value {
-	right := e.evalExpr(expr.Right, row, colIndex)
+func (e *Engine) evalUnaryOp(expr *parser.Expression, row []types.Value, colIndex map[string]int, rowID uint64) types.Value {
+	right := e.evalExpr(expr.Right, row, colIndex, rowID)
 
 	switch expr.Op {
 	case "NOT":
@@ -1356,15 +1413,15 @@ func (e *Engine) evalUnaryOp(expr *parser.Expression, row []types.Value, colInde
 }
 
 // evalCase evaluates a CASE expression
-func (e *Engine) evalCase(expr *parser.Expression, row []types.Value, colIndex map[string]int) types.Value {
+func (e *Engine) evalCase(expr *parser.Expression, row []types.Value, colIndex map[string]int, rowID uint64) types.Value {
 	for _, when := range expr.WhenClauses {
-		if e.evalBool(when.Cond, row, colIndex) {
-			return e.evalExpr(when.Then, row, colIndex)
+		if e.evalBool(when.Cond, row, colIndex, rowID) {
+			return e.evalExpr(when.Then, row, colIndex, rowID)
 		}
 	}
 
 	if expr.ElseExpr != nil {
-		return e.evalExpr(expr.ElseExpr, row, colIndex)
+		return e.evalExpr(expr.ElseExpr, row, colIndex, rowID)
 	}
 
 	return types.NewNullValue()
@@ -1465,13 +1522,13 @@ func (e *Engine) evalArithmetic(left, right types.Value, op string) types.Value 
 }
 
 // evalIn evaluates an IN expression
-func (e *Engine) evalIn(expr *parser.Expression, row []types.Value, colIndex map[string]int) types.Value {
+func (e *Engine) evalIn(expr *parser.Expression, row []types.Value, colIndex map[string]int, rowID uint64) types.Value {
 	// Evaluate the left operand
-	left := e.evalExpr(expr.Left, row, colIndex)
+	left := e.evalExpr(expr.Left, row, colIndex, rowID)
 
 	// Check against each value in the list
 	for _, item := range expr.List {
-		right := e.evalExpr(item, row, colIndex)
+		right := e.evalExpr(item, row, colIndex, rowID)
 		if left.Compare(right) == 0 {
 			return types.NewBoolValue(true)
 		}
@@ -1481,13 +1538,13 @@ func (e *Engine) evalIn(expr *parser.Expression, row []types.Value, colIndex map
 }
 
 // evalBetween evaluates a BETWEEN expression
-func (e *Engine) evalBetween(expr *parser.Expression, row []types.Value, colIndex map[string]int) types.Value {
+func (e *Engine) evalBetween(expr *parser.Expression, row []types.Value, colIndex map[string]int, rowID uint64) types.Value {
 	// Evaluate the value
-	val := e.evalExpr(expr.Left, row, colIndex)
+	val := e.evalExpr(expr.Left, row, colIndex, rowID)
 
 	// Evaluate the bounds
-	lower := e.evalExpr(expr.List[0], row, colIndex)
-	upper := e.evalExpr(expr.List[1], row, colIndex)
+	lower := e.evalExpr(expr.List[0], row, colIndex, rowID)
+	upper := e.evalExpr(expr.List[1], row, colIndex, rowID)
 
 	// Check if val is between lower and upper (inclusive)
 	if val.Compare(lower) >= 0 && val.Compare(upper) <= 0 {
@@ -1498,7 +1555,7 @@ func (e *Engine) evalBetween(expr *parser.Expression, row []types.Value, colInde
 }
 
 // evalMatchAgainst evaluates a MATCH...AGAINST expression for full-text search
-func (e *Engine) evalMatchAgainst(expr *parser.Expression, row []types.Value, colIndex map[string]int) types.Value {
+func (e *Engine) evalMatchAgainst(expr *parser.Expression, row []types.Value, colIndex map[string]int, rowID uint64) types.Value {
 	// Get the column value
 	colName := strings.ToLower(expr.MatchColumn)
 	idx, exists := colIndex[colName]
@@ -1508,6 +1565,7 @@ func (e *Engine) evalMatchAgainst(expr *parser.Expression, row []types.Value, co
 
 	content := row[idx].ToString()
 	query := expr.MatchQuery
+	level := expr.MatchLevel
 
 	// Find the table name from context (stored in expression or inferred)
 	tableName := expr.Table
@@ -1524,19 +1582,25 @@ func (e *Engine) evalMatchAgainst(expr *parser.Expression, row []types.Value, co
 
 	// Check if FTS index exists
 	if e.fts.HasIndex(tableName, colName) {
-		// Use FTS search
-		results, err := e.fts.Search(tableName, colName, query, 1000, 0)
+		var results []fts.SearchResult
+		var err error
+		// Use SearchWithLevel if level is specified
+		if level > 0 {
+			results, err = e.fts.SearchWithLevel(tableName, colName, query, level, 1000, 0)
+		} else {
+			results, err = e.fts.Search(tableName, colName, query, 1000, 0)
+		}
 		if err != nil {
 			e.log.Debug("FTS search error: %v", err)
 		} else {
-			// Check if any result matches the current content
+			// Build a set of matching row IDs for faster lookup
+			matchingIDs := make(map[uint64]bool)
 			for _, result := range results {
-				// For now, check if the query terms appear in content
-				// A more sophisticated approach would use row IDs
 				if result.Score > 0 {
-					return types.NewBoolValue(true)
+					matchingIDs[result.RowID] = true
 				}
 			}
+			return types.NewBoolValue(matchingIDs[rowID])
 		}
 	}
 
