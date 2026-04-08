@@ -66,6 +66,7 @@ func main() {
 	importTable := flag.String("table", "", "Source table to import")
 	importTo := flag.String("to", "", "Target table name (default: same as source)")
 	importAll := flag.Bool("import-all", false, "Import all tables from source database")
+	importSQL := flag.String("import-sql", "", "Import SQL backup file (MySQL dump format)")
 	batchSize := flag.Int("batch", 1000, "Batch size for import")
 	overwrite := flag.Bool("overwrite", false, "Overwrite existing tables")
 
@@ -264,6 +265,13 @@ func main() {
 		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 		<-sigChan
 		fmt.Println("\nShutting down...")
+		return
+	}
+
+	// Import SQL backup file if provided
+	if *importSQL != "" {
+		handleImportSQL(db, *importSQL)
+		db.Close()
 		return
 	}
 
